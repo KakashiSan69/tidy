@@ -1133,7 +1133,11 @@ test("model settings persist and resume the same session; usage respects per-tur
     designIds: [],
     settings: { model: "fixture-codex", effort: "high" },
   });
-  expect(runs[0].input.settings).toEqual({ model: "fixture-codex", effort: "high" });
+  expect(runs[0].input.settings).toEqual({
+    permissionMode: "default",
+    model: "fixture-codex",
+    effort: "high",
+  });
   const sessionId = randomUUID();
   runs[0].input.onUpdate({ type: "session", id: sessionId });
   runs[0].input.onUpdate({
@@ -1206,13 +1210,21 @@ test("running settings survive streamed updates and apply to queued follow-ups",
   expect((await service.readThread(project.id, thread.id)).settings).toEqual(next);
   expect((await store.readThread(project.id, thread.id)).settings).toEqual(next);
   expect(runs[0].input.settings).toEqual(original);
-  expect(runs[0].stopped).toBe(false);
-  const completion = finished(service, thread.id);
-  runs[0].complete();
-  await completion;
-  for (let attempt = 0; attempt < 100 && runs.length < 2; attempt++) await Bun.sleep(5);
+  expect(runs[0].stopped).toBe(true);
   expect(runs).toHaveLength(2);
   expect(runs[1].input.settings).toEqual(next);
+  expect(
+    (await service.readThread(project.id, thread.id)).messages.filter(
+      (message) => message.role === "user",
+    ),
+  ).toHaveLength(1);
+  expect((await service.readThread(project.id, thread.id)).queuedMessages).toHaveLength(1);
+  const completion = finished(service, thread.id);
+  runs[1].complete();
+  await completion;
+  for (let attempt = 0; attempt < 100 && runs.length < 3; attempt++) await Bun.sleep(5);
+  expect(runs).toHaveLength(3);
+  expect(runs[2].input.settings).toEqual(next);
   expect((await service.readThread(project.id, thread.id)).queuedMessages).toHaveLength(0);
 });
 
@@ -1221,7 +1233,7 @@ test("running settings reject foreign projects and roll back failed validation o
   const { service, store, project, runs, directory } = await fixture(async () => {
     if (invalid) throw new Error("Invalid settings");
   });
-  const original = { model: "first-model" };
+  const original = { model: "first-model", permissionMode: "default" as const };
   const thread = await service.startThread({
     projectId: project.id,
     harness: "codex",
@@ -1563,6 +1575,9 @@ test("permission modes persist for follow-ups while live requests disappear on c
   expect(runs[1].input.settings?.permissionMode).toBe("plan");
   await service.setThreadSettings(project.id, thread.id, { permissionMode: "auto" });
   expect(runs[1].input.settings?.permissionMode).toBe("plan");
+  expect(runs[1].stopped).toBe(true);
+  expect(runs[2].input.settings?.permissionMode).toBe("auto");
+  expect(runs[2].input.sessionId).toBe(thread.sessionId ?? runs[1].input.sessionId);
   expect((await service.readThread(project.id, thread.id)).settings?.permissionMode).toBe("auto");
 });
 
@@ -2739,3 +2754,271 @@ test("naming requested after shutdown never starts an access check", async () =>
     access.mockRestore();
   }
 }, 1000);
+
+test("Stop during an access change prevents automatic continuation", async () => {
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let changing = false;
+  const { service, project, runs } = await fixture(async () => {
+    if (changing) {
+      entered.resolve();
+      await release.promise;
+    }
+  });
+  const thread = await service.startThread({
+    projectId: project.id,
+    harness: "codex",
+    prompt: "Work",
+    designIds: [],
+  });
+  changing = true;
+  const change = service.setThreadSettings(project.id, thread.id, { permissionMode: "auto" });
+  await entered.promise;
+  await service.stopThread(project.id, thread.id);
+  release.resolve();
+  await change;
+  expect(runs).toHaveLength(1);
+  expect(runs[0].stopped).toBe(true);
+  expect((await service.readThread(project.id, thread.id)).status).toBe("stopped");
+});
+
+test("failed access persistence keeps the original running policy and approval", async () => {
+  const { service, store, project, runs } = await fixture();
+  const thread = await service.startThread({
+    projectId: project.id,
+    harness: "codex",
+    prompt: "Work",
+    designIds: [],
+  });
+  const approval = {
+    id: randomUUID(),
+    title: "Allow action?",
+    choices: ["allow", "deny"] as Array<"allow" | "deny">,
+  };
+  runs[0].input.onUpdate({ type: "approval", request: approval });
+  const write = store.writeThread.bind(store);
+  store.writeThread = async () => {
+    throw new Error("Disk full");
+  };
+  try {
+    await expect(
+      service.setThreadSettings(project.id, thread.id, { permissionMode: "auto" }),
+    ).rejects.toThrow("Disk full");
+  } finally {
+    store.writeThread = write;
+  }
+  expect(runs).toHaveLength(1);
+  expect(runs[0].stopped).toBe(false);
+  const after = await service.readThread(project.id, thread.id);
+  expect(after.settings?.permissionMode).toBe("default");
+  expect(after.pendingApprovals).toEqual([approval]);
+});
+
+test("Stop and switch pauses only this thread, keeps its queue and conversation, and waits for a new instruction", async () => {
+  const { directory, store, service, project, runs } = await fixture();
+  const root = join(directory, "handover-cloud");
+  await mkdir(root);
+  const cloud = (await store.open(root, "Team")).project;
+  service.authorizeCloudProject = async () => {};
+  const thread = await service.startThread({
+    projectId: cloud.id,
+    executionProjectId: project.id,
+    harness: "codex",
+    prompt: "First task",
+    designIds: [],
+  });
+  runs[0].input.onUpdate({ type: "session", id: randomUUID() });
+  runs[0].input.onUpdate({
+    type: "approval",
+    request: { id: randomUUID(), title: "Allow?", choices: ["allow", "deny"] },
+  });
+  await service.sendMessage({
+    projectId: cloud.id,
+    threadId: thread.id,
+    text: "Queued task",
+    delivery: "queue",
+  });
+  const unrelated = await service.startThread({
+    projectId: project.id,
+    harness: "codex",
+    prompt: "Other task",
+    designIds: [],
+  });
+  const before = await service.readThread(cloud.id, thread.id);
+  const changed = await service.setThreadExecutionProject(cloud.id, thread.id, undefined, true);
+  expect(runs[0].stopped).toBe(true);
+  expect(runs[1].stopped).toBe(false);
+  expect((await service.readThread(project.id, unrelated.id)).status).toBe("running");
+  expect(changed.status).toBe("stopped");
+  expect(changed.executionProjectId).toBeUndefined();
+  expect(changed.sessionId).toBeUndefined();
+  expect(changed.pendingApprovals).toBeUndefined();
+  expect(changed.messages.map(({ id, text }) => ({ id, text }))).toEqual(
+    before.messages.map(({ id, text }) => ({ id, text })),
+  );
+  expect(changed.queuedMessages).toEqual(before.queuedMessages);
+  expect(runs).toHaveLength(2);
+  await service.sendMessage({
+    projectId: cloud.id,
+    threadId: thread.id,
+    text: "Now work here",
+    delivery: "steer",
+  });
+  expect(runs.at(-1)!.input.cwd).toBe(cloud.path);
+  expect(runs.at(-1)!.input.sessionId).toBeUndefined();
+  expect(runs.at(-1)!.input.prompt).toContain("First task");
+});
+
+test("Stop and switch validates the destination and access before stopping active work", async () => {
+  const { directory, store, service, project, runs } = await fixture();
+  const root = join(directory, "validated-cloud");
+  await mkdir(root);
+  const cloud = (await store.open(root, "Team")).project;
+  service.authorizeCloudProject = async () => {};
+  const thread = await service.startThread({
+    projectId: cloud.id,
+    harness: "codex",
+    prompt: "Work",
+    designIds: [],
+  });
+  await expect(
+    service.setThreadExecutionProject(cloud.id, thread.id, randomUUID(), true),
+  ).rejects.toThrow();
+  await expect(
+    service.setThreadExecutionProject(cloud.id, thread.id, cloud.id, true),
+  ).rejects.toThrow("local project");
+  service.authorizeCloudProject = async () => {
+    throw new Error("Access revoked");
+  };
+  await expect(
+    service.setThreadExecutionProject(cloud.id, thread.id, project.id, true),
+  ).rejects.toThrow("Access revoked");
+  expect(runs[0].stopped).toBe(false);
+  expect(runs).toHaveLength(1);
+});
+
+test("failed project persistence restores private execution authority", async () => {
+  const { directory, store, service, project, runs } = await fixture();
+  const root = join(directory, "failed-switch-cloud");
+  await mkdir(root);
+  const cloud = (await store.open(root, "Team")).project;
+  service.authorizeCloudProject = async () => {};
+  const thread = await service.startThread({
+    projectId: cloud.id,
+    harness: "codex",
+    prompt: "Work",
+    designIds: [],
+  });
+  const done = finished(service, thread.id);
+  runs[0].complete();
+  await done;
+  const write = store.writeThread.bind(store);
+  store.writeThread = async () => {
+    throw new Error("Disk full");
+  };
+  try {
+    await expect(
+      service.setThreadExecutionProject(cloud.id, thread.id, project.id),
+    ).rejects.toThrow("Disk full");
+  } finally {
+    store.writeThread = write;
+  }
+  const recovered = await store.readThread(cloud.id, thread.id);
+  expect(recovered.executionProjectId).toBeUndefined();
+  await store.assertThreadExecution(recovered);
+  await service.setThreadExecutionProject(cloud.id, thread.id, project.id);
+  expect((await service.readThread(cloud.id, thread.id)).executionProjectId).toBe(project.id);
+});
+
+test("Stop during the handover checkpoint leaves a stopped thread without replaying its task", async () => {
+  const { service, store, project, runs } = await fixture();
+  const thread = await service.startThread({
+    projectId: project.id,
+    harness: "codex",
+    prompt: "Work",
+    designIds: [],
+  });
+  const entered = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<void>();
+  const write = store.writeThread.bind(store);
+  let gated = false;
+  store.writeThread = async (value) => {
+    if (!gated && value.activity === "Resuming with updated access") {
+      gated = true;
+      entered.resolve();
+      await release.promise;
+    }
+    await write(value);
+  };
+  const change = service.setThreadSettings(project.id, thread.id, { permissionMode: "auto" });
+  await entered.promise;
+  await service.stopThread(project.id, thread.id);
+  release.resolve();
+  await change;
+  const after = await service.readThread(project.id, thread.id);
+  expect(after.status).toBe("stopped");
+  expect(after.activity).toBeUndefined();
+  expect(after.messages[0].turn?.endedAt).toBeDefined();
+  expect(runs).toHaveLength(1);
+});
+
+test.each([false, true])(
+  "failed handover preparation clears running state and preserves follow-ups (Stop: %s)",
+  async (stop) => {
+    const entered = Promise.withResolvers<void>(),
+      release = Promise.withResolvers<void>();
+    const failure = new Error("The harness executable is unavailable.");
+    let failing = false;
+    const { service, store, project, runs } = await fixture(
+      undefined,
+      false,
+      undefined,
+      false,
+      undefined,
+      async () => {
+        if (failing) {
+          entered.resolve();
+          await release.promise;
+          throw failure;
+        }
+        return "/fixture/harness";
+      },
+    );
+    const thread = await service.startThread({
+      projectId: project.id,
+      harness: "codex",
+      prompt: "Work",
+      designIds: [],
+    });
+    await service.sendMessage({
+      projectId: project.id,
+      threadId: thread.id,
+      text: "A queued follow-up",
+      delivery: "queue",
+    });
+    const events: Thread[] = [];
+    const unsubscribe = service.subscribe((event) => {
+      if (event.type === "thread" && event.thread.id === thread.id) events.push(event.thread);
+    });
+    failing = true;
+    const change = service.setThreadSettings(project.id, thread.id, { permissionMode: "auto" });
+    await entered.promise;
+    if (stop) await service.stopThread(project.id, thread.id);
+    release.resolve();
+    await expect(change).rejects.toBe(failure);
+    unsubscribe();
+    const after = await store.readThread(project.id, thread.id);
+    expect(after.status).toBe(stop ? "stopped" : "failed");
+    expect(after.activity).toBeUndefined();
+    if (!stop) expect(after.error).toBe(failure.message);
+    expect(after.messages).toHaveLength(1);
+    expect(after.messages[0].turn?.endedAt).toBeDefined();
+    expect(after.queuedMessages?.map((message) => message.text)).toEqual(["A queued follow-up"]);
+    expect(after.settings?.permissionMode).toBe("auto");
+    expect(events.at(-1)?.status).toBe(after.status);
+    expect(runs).toHaveLength(1);
+    failing = false;
+    await service.sendMessage({ projectId: project.id, threadId: thread.id, text: "Try again" });
+    expect(runs).toHaveLength(2);
+  },
+);

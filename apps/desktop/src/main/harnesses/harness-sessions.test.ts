@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, expect, test } from "bun:test";
+import { afterAll, beforeAll, expect, spyOn, test } from "bun:test";
 import { chmod, copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -252,9 +252,8 @@ for (const harness of harnessIdSchema.options) {
       const original = await done;
       const pid = (await events(cwd))[0].pid;
       for (const settings of [
-        { permissionMode: "auto" as const },
-        { model: "another-model" },
-        { effort: "high" },
+        { ...original.settings, model: "another-model" },
+        { ...original.settings, effort: "high" },
       ]) {
         await expect(service.setThreadSettings(project.id, thread.id, settings)).rejects.toThrow(
           "Keep its current",
@@ -265,7 +264,7 @@ for (const harness of harnessIdSchema.options) {
       // Block before catalog/network discovery; default and explicitly selected default are equivalent.
       expect(validations).toBe(0);
       await service.setThreadSettings(project.id, thread.id, {
-        permissionMode: harness === "claude" ? "accept-edits" : "default",
+        permissionMode: "default",
       });
       done = finished();
       await service.sendMessage({ projectId: project.id, threadId: thread.id, text: "continue" });
@@ -327,12 +326,13 @@ test("a retained-session conflict leaves the follow-up unsent and can recover a 
     expect(after.status).toBe("completed");
     expect(after.revision).toBe(incompatible.revision);
     expect(await events(cwd)).toEqual(before);
-    // Reverting to the native session's settings is allowed even with background work.
-    await service.setThreadSettings(project.id, thread.id, {});
+    // Stop releases the stale background session even if an old app saved incompatible settings.
+    await service.stopThread(project.id, thread.id);
     done = finished();
     await service.sendMessage({ projectId: project.id, threadId: thread.id, text: "continue" });
     expect((await done).status).toBe("completed");
-    expect(new Set((await events(cwd)).map((event) => event.pid))).toEqual(new Set([pid]));
+    expect(() => process.kill(pid, 0)).toThrow();
+    expect(new Set((await events(cwd)).map((event) => event.pid)).size).toBe(2);
   } finally {
     await service.close();
   }
@@ -420,7 +420,7 @@ test("settings selected during a native run persist for its next turn without in
     const settings = {
       model: "another-model",
       effort: "high",
-      permissionMode: "read-only" as const,
+      permissionMode: "default" as const,
     };
     const changed = await service.setThreadSettings(project.id, thread.id, settings);
     expect(changed.status).toBe("running");
@@ -1238,3 +1238,508 @@ for (const harness of harnessIdSchema.options) {
     }
   });
 }
+
+for (const harness of harnessIdSchema.options) {
+  test(`${harness} applies changed access to the active request and clears stale approvals and background work`, async () => {
+    const { ProjectStore } = await import("../workspace/project-store");
+    const { WorkspaceService } = await import("../workspace/workspace-service");
+    const cwd = await mkdtemp(join(directory, `${harness}-live-access-`));
+    const store = new ProjectStore(join(cwd, "private"));
+    await store.initialize();
+    const { project } = await store.open(cwd);
+    const service = new WorkspaceService(
+      store,
+      undefined,
+      async () => executable,
+      async () => {},
+    );
+    try {
+      const thread = await service.startThread({
+        projectId: project.id,
+        harness,
+        prompt: "approve background silent",
+        designIds: [],
+      });
+      let original = await service.readThread(project.id, thread.id);
+      for (let attempt = 0; !original.pendingApprovals?.length && attempt < 100; attempt++) {
+        await Bun.sleep(5);
+        original = await service.readThread(project.id, thread.id);
+      }
+      expect(original.pendingApprovals).toHaveLength(1);
+      expect(original.settings?.permissionMode).toBe("default");
+      const approvalId = original.pendingApprovals![0].id;
+      const pid = (await events(cwd))[0].pid;
+      await service.setThreadSettings(project.id, thread.id, { permissionMode: "auto" });
+      let after = await service.readThread(project.id, thread.id);
+      for (let attempt = 0; after.status === "running" && attempt < 100; attempt++) {
+        await Bun.sleep(5);
+        after = await service.readThread(project.id, thread.id);
+      }
+      expect(after.status).toBe("completed");
+      expect(after.settings?.permissionMode).toBe("auto");
+      expect(after.pendingApprovals).toBeUndefined();
+      expect(after.sessionId).toBe(original.sessionId);
+      expect(
+        after.messages.filter((message) => message.role === "user").map((message) => message.id),
+      ).toEqual([original.messages[0].id]);
+      expect(after.messages[0].turn?.startedAt).toBe(original.messages[0].turn?.startedAt);
+      expect(() => process.kill(pid, 0)).toThrow();
+      expect(new Set((await events(cwd)).map((event) => event.pid)).size).toBe(2);
+      await expect(
+        service.respondToApproval(project.id, thread.id, approvalId, "allow"),
+      ).rejects.toThrow("no longer");
+      if (harness === "codex") {
+        const resume = (await events(cwd)).find((event) => event.method === "thread/resume");
+        expect(resume?.value.params).toMatchObject({
+          sandbox: "danger-full-access",
+          approvalPolicy: "never",
+        });
+      }
+      // The old background work must not block a later model change either.
+      await service.setThreadSettings(project.id, thread.id, {
+        permissionMode: "auto",
+        model: "another-model",
+      });
+    } finally {
+      await service.close();
+    }
+  });
+
+  test(`${harness} Stop releases retained background work so settings and follow-ups remain usable`, async () => {
+    const { ProjectStore } = await import("../workspace/project-store");
+    const { WorkspaceService } = await import("../workspace/workspace-service");
+    const cwd = await mkdtemp(join(directory, `${harness}-stop-background-`));
+    const store = new ProjectStore(join(cwd, "private"));
+    await store.initialize();
+    const { project } = await store.open(cwd);
+    const service = new WorkspaceService(
+      store,
+      undefined,
+      async () => executable,
+      async () => {},
+    );
+    try {
+      const thread = await service.startThread({
+        projectId: project.id,
+        harness,
+        prompt: "background silent",
+        designIds: [],
+      });
+      for (
+        let attempt = 0;
+        (await service.readThread(project.id, thread.id)).status === "running" && attempt < 100;
+        attempt++
+      )
+        await Bun.sleep(5);
+      const original = await service.readThread(project.id, thread.id);
+      expect(original.status).toBe("completed");
+      const pid = (await events(cwd))[0].pid;
+      await service.stopThread(project.id, thread.id);
+      expect(() => process.kill(pid, 0)).toThrow();
+      await service.setThreadSettings(project.id, thread.id, {
+        permissionMode: "default",
+        model: "another-model",
+      });
+      await service.sendMessage({ projectId: project.id, threadId: thread.id, text: "Continue" });
+      for (
+        let attempt = 0;
+        (await service.readThread(project.id, thread.id)).status === "running" && attempt < 100;
+        attempt++
+      )
+        await Bun.sleep(5);
+      const after = await service.readThread(project.id, thread.id);
+      expect(after.status).toBe("completed");
+      expect(after.sessionId).toBe(original.sessionId);
+      expect(after.messages.filter((message) => message.role === "user")).toHaveLength(2);
+    } finally {
+      await service.close();
+    }
+  });
+}
+
+test.each([false, true])(
+  "access handover preserves an unsubmitted queued request and its attachments (Stop: %s)",
+  async (stop) => {
+    const { ProjectStore } = await import("../workspace/project-store");
+    const { WorkspaceService } = await import("../workspace/workspace-service");
+    const { ThreadPorts } = await import("../processes/thread-ports");
+    const cwd = await mkdtemp(join(directory, "queued-access-handover-"));
+    const store = new ProjectStore(join(cwd, "private"));
+    await store.initialize();
+    const { project } = await store.open(cwd);
+    const attachment = await store.addAttachment(
+      project.id,
+      "second-task.txt",
+      "data:text/plain;base64,bm90ZXM=",
+    );
+    const service = new WorkspaceService(
+      store,
+      undefined,
+      async () => executable,
+      async () => {},
+    );
+    const firstFinished = Promise.withResolvers<void>();
+    const secondFinished = Promise.withResolvers<void>();
+    const registering = Promise.withResolvers<void>();
+    const releaseRegistration = Promise.withResolvers<void>();
+    const handingOver = Promise.withResolvers<void>();
+    service.subscribe((event) => {
+      if (event.type !== "thread") return;
+      if (event.thread.activity === "Resuming with updated access") handingOver.resolve();
+      if (event.thread.status !== "completed") return;
+      if (event.thread.messages.some((message) => message.text === "Second pending request"))
+        secondFinished.resolve();
+      else firstFinished.resolve();
+    });
+    let holdRegistration = false;
+    const register = ThreadPorts.prototype.register;
+    const registration = spyOn(ThreadPorts.prototype, "register").mockImplementation(
+      async function (this: InstanceType<typeof ThreadPorts>, ...args) {
+        if (holdRegistration) {
+          holdRegistration = false;
+          registering.resolve();
+          await releaseRegistration.promise;
+        }
+        return register.apply(this, args);
+      },
+    );
+    try {
+      const thread = await service.startThread({
+        projectId: project.id,
+        harness: "codex",
+        prompt: "First finished request",
+        designIds: [],
+      });
+      await firstFinished.promise;
+      await service.stopThread(project.id, thread.id);
+      holdRegistration = true;
+      await service.sendMessage({
+        projectId: project.id,
+        threadId: thread.id,
+        text: "Second pending request",
+        attachmentIds: [attachment.id],
+        delivery: "queue",
+      });
+      await registering.promise;
+      const changing = service.setThreadSettings(project.id, thread.id, {
+        permissionMode: "auto",
+      });
+      await handingOver.promise;
+      const stopping = stop ? service.stopThread(project.id, thread.id) : undefined;
+      releaseRegistration.resolve();
+      await stopping;
+      await changing;
+      if (!stop) await secondFinished.promise;
+      const after = await service.readThread(project.id, thread.id);
+      const users = after.messages.filter((message) => message.role === "user");
+      expect(users.map((message) => message.text)).toEqual(
+        stop ? ["First finished request"] : ["First finished request", "Second pending request"],
+      );
+      expect(after.queuedMessages?.map((message) => message.text)).toEqual(
+        stop ? ["Second pending request"] : [],
+      );
+      const delivered = stop ? after.queuedMessages?.[0] : users[1];
+      expect(delivered?.attachments?.map((file) => file.id)).toEqual([attachment.id]);
+      const turns = (await events(cwd)).filter((event) => event.method === "turn/start");
+      expect(turns).toHaveLength(stop ? 1 : 2);
+      if (!stop) {
+        expect(JSON.stringify(turns[1].value.params)).toContain("Second pending request");
+        expect(JSON.stringify(turns[1].value.params)).toContain("second-task.txt");
+      }
+    } finally {
+      releaseRegistration.resolve();
+      registration.mockRestore();
+      await service.close();
+    }
+  },
+);
+
+for (const harness of ["codex", "claude"] as const) {
+  test(`${harness} updates supported permissions on the running native session without replaying its request`, async () => {
+    const { ProjectStore } = await import("../workspace/project-store");
+    const { WorkspaceService } = await import("../workspace/workspace-service");
+    const cwd = await mkdtemp(join(directory, `${harness}-live-update-`));
+    await writeFile(join(cwd, "live-permissions"), "");
+    const store = new ProjectStore(join(cwd, "private"));
+    await store.initialize();
+    const { project } = await store.open(cwd);
+    const service = new WorkspaceService(
+      store,
+      undefined,
+      async () => executable,
+      async () => {},
+    );
+    const started = Promise.withResolvers<void>();
+    service.subscribe((event) => {
+      if (event.type === "thread" && event.thread.activity === "Working") started.resolve();
+    });
+    try {
+      const thread = await service.startThread({
+        projectId: project.id,
+        harness,
+        prompt: "hold",
+        designIds: [],
+      });
+      await started.promise;
+      const before = await service.readThread(project.id, thread.id);
+      const pid = (await events(cwd))[0].pid;
+      const after = await service.setThreadSettings(project.id, thread.id, {
+        permissionMode: "provider-auto",
+      });
+      expect(after.status).toBe("running");
+      expect(after.sessionId).toBe(before.sessionId);
+      expect(after.messages).toEqual(before.messages);
+      expect(after.settings?.permissionMode).toBe("provider-auto");
+      const log = await events(cwd);
+      expect(new Set(log.map((event) => event.pid))).toEqual(new Set([pid]));
+      expect(
+        log.filter((event) => event.method === "turn/start" || event.type === "user"),
+      ).toHaveLength(1);
+      expect(
+        log.some(
+          (event) =>
+            event.method === (harness === "codex" ? "turn/settings/update" : "set_permission_mode"),
+        ),
+      ).toBe(true);
+      if (harness === "codex")
+        expect(
+          log.find((event) => event.method === "turn/settings/update")?.value.params,
+        ).toMatchObject({ approvalsReviewer: "auto_review" });
+      expect(() => process.kill(pid, 0)).not.toThrow();
+      // A live downgrade uses the same connection, too.
+      await service.setThreadSettings(project.id, thread.id, { permissionMode: "default" });
+      expect(new Set((await events(cwd)).map((event) => event.pid))).toEqual(new Set([pid]));
+    } finally {
+      await service.close();
+    }
+  });
+
+  test(`${harness} falls back to a single continuation when live permissions are unsupported`, async () => {
+    const { ProjectStore } = await import("../workspace/project-store");
+    const { WorkspaceService } = await import("../workspace/workspace-service");
+    const cwd = await mkdtemp(join(directory, `${harness}-unsupported-live-`));
+    const store = new ProjectStore(join(cwd, "private"));
+    await store.initialize();
+    const { project } = await store.open(cwd);
+    const service = new WorkspaceService(
+      store,
+      undefined,
+      async () => executable,
+      async () => {},
+    );
+    const started = Promise.withResolvers<void>();
+    service.subscribe((event) => {
+      if (event.type === "thread" && event.thread.activity === "Working") started.resolve();
+    });
+    try {
+      const thread = await service.startThread({
+        projectId: project.id,
+        harness,
+        prompt: "hold",
+        designIds: [],
+      });
+      await started.promise;
+      const before = await service.readThread(project.id, thread.id);
+      await service.setThreadSettings(project.id, thread.id, { permissionMode: "provider-auto" });
+      for (
+        let i = 0;
+        (await service.readThread(project.id, thread.id)).status === "running" && i < 100;
+        i++
+      )
+        await Bun.sleep(5);
+      const after = await service.readThread(project.id, thread.id);
+      expect(after.status).toBe("completed");
+      expect(after.sessionId).toBe(before.sessionId);
+      expect(after.messages.filter((message) => message.role === "user")).toHaveLength(1);
+      expect(new Set((await events(cwd)).map((event) => event.pid)).size).toBe(2);
+      const log = await events(cwd);
+      expect(
+        log.filter((event) => event.method === "turn/start" || event.type === "user"),
+      ).toHaveLength(2);
+      expect(JSON.stringify(log)).toContain("Do not repeat completed actions");
+      expect(JSON.stringify(log)).toContain("Do not assume an interruption rolled back");
+    } finally {
+      await service.close();
+    }
+  });
+}
+
+test("a pending approval forces a handover instead of silently approving it under a live policy", async () => {
+  const { ProjectStore } = await import("../workspace/project-store");
+  const { WorkspaceService } = await import("../workspace/workspace-service");
+  const cwd = await mkdtemp(join(directory, "pending-live-"));
+  await writeFile(join(cwd, "live-permissions"), "");
+  const store = new ProjectStore(join(cwd, "private"));
+  await store.initialize();
+  const { project } = await store.open(cwd);
+  const service = new WorkspaceService(
+    store,
+    undefined,
+    async () => executable,
+    async () => {},
+  );
+  try {
+    const thread = await service.startThread({
+      projectId: project.id,
+      harness: "codex",
+      prompt: "approve",
+      designIds: [],
+    });
+    for (
+      let i = 0;
+      !(await service.readThread(project.id, thread.id)).pendingApprovals?.length && i < 100;
+      i++
+    )
+      await Bun.sleep(5);
+    expect((await service.readThread(project.id, thread.id)).pendingApprovals).toHaveLength(1);
+    await service.setThreadSettings(project.id, thread.id, { permissionMode: "provider-auto" });
+    for (
+      let i = 0;
+      (await service.readThread(project.id, thread.id)).status === "running" && i < 100;
+      i++
+    )
+      await Bun.sleep(5);
+    const after = await service.readThread(project.id, thread.id);
+    expect(after.status).toBe("completed");
+    expect(after.pendingApprovals).toBeUndefined();
+    const log = await events(cwd);
+    expect(log.some((event) => event.method === "turn/settings/update")).toBe(false);
+    expect(new Set(log.map((event) => event.pid)).size).toBe(2);
+    expect(after.messages.filter((message) => message.role === "user")).toHaveLength(1);
+  } finally {
+    await service.close();
+  }
+});
+
+test("Stop while the provider acknowledges a live change cannot restart the thread", async () => {
+  const { ProjectStore } = await import("../workspace/project-store");
+  const { WorkspaceService } = await import("../workspace/workspace-service");
+  const cwd = await mkdtemp(join(directory, "stop-live-"));
+  await writeFile(join(cwd, "live-permissions"), "");
+  await writeFile(join(cwd, "slow-live-permissions"), "");
+  const store = new ProjectStore(join(cwd, "private"));
+  await store.initialize();
+  const { project } = await store.open(cwd);
+  const service = new WorkspaceService(
+    store,
+    undefined,
+    async () => executable,
+    async () => {},
+  );
+  const started = Promise.withResolvers<void>();
+  service.subscribe((event) => {
+    if (event.type === "thread" && event.thread.activity === "Working") started.resolve();
+  });
+  try {
+    const thread = await service.startThread({
+      projectId: project.id,
+      harness: "codex",
+      prompt: "hold",
+      designIds: [],
+    });
+    await started.promise;
+    const change = service.setThreadSettings(project.id, thread.id, {
+      permissionMode: "provider-auto",
+    });
+    for (
+      let i = 0;
+      !(await events(cwd)).some((event) => event.method === "thread/settings/update") && i < 100;
+      i++
+    )
+      await Bun.sleep(2);
+    await service.stopThread(project.id, thread.id);
+    await change;
+    expect((await service.readThread(project.id, thread.id)).status).toBe("stopped");
+    expect((await events(cwd)).filter((event) => event.method === "turn/start")).toHaveLength(1);
+    expect(new Set((await events(cwd)).map((event) => event.pid)).size).toBe(1);
+  } finally {
+    await service.close();
+  }
+});
+
+test("idle live permission updates preserve a compatible native session for the next message", async () => {
+  const { ProjectStore } = await import("../workspace/project-store");
+  const { WorkspaceService } = await import("../workspace/workspace-service");
+  const cwd = await mkdtemp(join(directory, "idle-live-"));
+  await writeFile(join(cwd, "live-permissions"), "");
+  const store = new ProjectStore(join(cwd, "private"));
+  await store.initialize();
+  const { project } = await store.open(cwd);
+  const service = new WorkspaceService(
+    store,
+    undefined,
+    async () => executable,
+    async () => {},
+  );
+  try {
+    const thread = await service.startThread({
+      projectId: project.id,
+      harness: "codex",
+      prompt: "first",
+      designIds: [],
+    });
+    for (
+      let i = 0;
+      (await service.readThread(project.id, thread.id)).status === "running" && i < 100;
+      i++
+    )
+      await Bun.sleep(5);
+    await service.setThreadSettings(project.id, thread.id, { permissionMode: "provider-auto" });
+    await service.sendMessage({ projectId: project.id, threadId: thread.id, text: "second" });
+    for (
+      let i = 0;
+      (await service.readThread(project.id, thread.id)).status === "running" && i < 100;
+      i++
+    )
+      await Bun.sleep(5);
+    const after = await service.readThread(project.id, thread.id);
+    expect(after.status).toBe("completed");
+    expect(after.messages.filter((message) => message.role === "user")).toHaveLength(2);
+    expect(new Set((await events(cwd)).map((event) => event.pid)).size).toBe(1);
+  } finally {
+    await service.close();
+  }
+});
+
+test("a rejected Claude Auto mode keeps the previous permissions and running session", async () => {
+  const { ProjectStore } = await import("../workspace/project-store");
+  const { WorkspaceService } = await import("../workspace/workspace-service");
+  const cwd = await mkdtemp(join(directory, "rejected-live-"));
+  await writeFile(join(cwd, "reject-live-permissions"), "");
+  const store = new ProjectStore(join(cwd, "private"));
+  await store.initialize();
+  const { project } = await store.open(cwd);
+  const service = new WorkspaceService(
+    store,
+    undefined,
+    async () => executable,
+    async () => {},
+  );
+  const started = Promise.withResolvers<void>();
+  service.subscribe((event) => {
+    if (event.type === "thread" && event.thread.activity === "Working") started.resolve();
+  });
+  try {
+    const thread = await service.startThread({
+      projectId: project.id,
+      harness: "claude",
+      prompt: "hold",
+      designIds: [],
+    });
+    await started.promise;
+    const pid = (await events(cwd))[0].pid;
+    await expect(
+      service.setThreadSettings(project.id, thread.id, { permissionMode: "provider-auto" }),
+    ).rejects.toThrow("auto mode unavailable");
+    const after = await service.readThread(project.id, thread.id);
+    expect(after.status).toBe("running");
+    expect(after.settings?.permissionMode).toBe("default");
+    expect((await store.readThread(project.id, thread.id)).settings?.permissionMode).toBe(
+      "default",
+    );
+    expect(new Set((await events(cwd)).map((event) => event.pid))).toEqual(new Set([pid]));
+    expect(() => process.kill(pid, 0)).not.toThrow();
+  } finally {
+    await service.close();
+  }
+});

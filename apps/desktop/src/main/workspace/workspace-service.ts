@@ -29,6 +29,7 @@ import { summarizeThread } from "../../shared/models/thread-updates";
 import { threadHistoryContext } from "../../shared/models/thread-context";
 import {
   approvalDecisionSchema,
+  effectivePermissionMode,
   validatePermissionMode,
   type ApprovalDecision,
 } from "../../shared/contracts/permissions";
@@ -103,6 +104,7 @@ type Job = {
 type FinishJobRequest = { job: Job } & (
   | { kind: "complete" }
   | { kind: "stop" }
+  | { kind: "handover" }
   | { kind: "done"; doneAt: string }
 );
 
@@ -765,23 +767,30 @@ export class WorkspaceService {
   }
 
   /** A UI-authorized directory change must never resume the old native session. */
-  setThreadExecutionProject(projectId: string, threadId: string, executionProjectId?: string) {
+  setThreadExecutionProject(
+    projectId: string,
+    threadId: string,
+    executionProjectId?: string,
+    stopActive = false,
+  ): Promise<Thread> {
     return this.serialize(threadId, async () => {
       if (this.closing) throw new Error("Tidy is closing.");
-      if (this.starting.has(threadId) || this.jobs.has(threadId))
+      if (this.starting.has(threadId) || (!stopActive && this.jobs.has(threadId)))
         throw new Error("Wait for this run to finish before changing its project.");
       this.starting.set(threadId, projectId);
       this.executionProjects.set(threadId, executionProjectId ?? projectId);
       try {
         await this.assertProjectAccess(projectId);
-        const thread = await this.store.readThread(projectId, threadId);
+        const thread = await this.mutableThread(projectId, threadId);
+        await this.store.assertThreadExecution(thread);
         if (!this.store.project(projectId).cloud)
           throw new Error("Only workspace threads can change their execution project.");
         const target = this.executionProject({ projectId, executionProjectId });
         if (thread.executionProjectId === executionProjectId) return thread;
         if (
-          thread.status === "running" ||
-          this.sessions.backgroundContexts.some((item) => item.threadId === threadId)
+          !stopActive &&
+          (thread.status === "running" ||
+            this.sessions.backgroundContexts.some((item) => item.threadId === threadId))
         )
           throw new Error(
             "Wait for this thread's active work to finish before changing its project.",
@@ -792,8 +801,19 @@ export class WorkspaceService {
           );
         if ((await realpath(target.path)) !== target.path)
           throw new Error("The execution project directory moved. Open it again.");
+        // Validate ownership and the destination before interrupting any work.
+        // The explicit stopActive action pauses the queue and never replays it here.
+        const job = this.jobs.get(threadId);
+        if (stopActive) {
+          this.requestThreadStop(projectId, threadId, true);
+          await this.store.updateResumes.cancel(projectId, threadId);
+        }
         this.sessionGeneration++;
-        await this.sessions.clear({ threadId });
+        await this.sessions.clear({ threadId, projectIds: new Set([projectId]) });
+        if (job) {
+          await job.process?.done.catch(() => {});
+          await this.finish({ job, kind: "stop" });
+        }
         await this.assertProjectAccess(projectId);
         if (this.closing) throw new Error("Tidy is closing.");
         const next = await this.store.changeThreadExecution(thread, executionProjectId);
@@ -802,6 +822,7 @@ export class WorkspaceService {
       } finally {
         this.starting.delete(threadId);
         this.executionProjects.delete(threadId);
+        this.cancelledStarts.delete(threadId);
       }
     });
   }
@@ -818,14 +839,21 @@ export class WorkspaceService {
   ) {
     if (this.closing) throw new Error("Tidy is closing.");
     this.starting.set(threadId, projectId);
+    const stopVersion = this.stopVersions.get(threadId) ?? 0;
     try {
       const thread = await this.mutableThread(projectId, threadId);
       if (this.closing) throw new Error("Tidy is closing.");
       await this.assertProjectAccess(projectId);
-      if (!this.jobs.has(threadId)) this.sessions.assertSettingsCanChange(threadId, settings);
+      const permissionsChanged =
+        effectivePermissionMode(thread.harness, thread.settings?.permissionMode) !==
+        effectivePermissionMode(thread.harness, settings.permissionMode);
+      if (!permissionsChanged && !this.jobs.has(threadId))
+        this.sessions.assertSettingsCanChange(threadId, settings);
       await this.configure(thread.harness, this.executionProject(thread).path, settings);
+      await this.assertProjectAccess(projectId);
       if (this.closing) throw new Error("Tidy is closing.");
-      if (!this.jobs.has(threadId)) this.sessions.assertSettingsCanChange(threadId, settings);
+      if (!permissionsChanged && !this.jobs.has(threadId))
+        this.sessions.assertSettingsCanChange(threadId, settings);
       const previous = thread.settings;
       thread.settings = settings;
       thread.revision++;
@@ -837,7 +865,119 @@ export class WorkspaceService {
         this.emit({ type: "thread", thread });
         throw error;
       }
-      this.emit({ type: "thread", thread });
+      if (permissionsChanged) {
+        const active = this.jobs.get(threadId);
+        try {
+          if (
+            !active?.stopped &&
+            (await this.sessions.updatePermissions(threadId, projectId, settings))
+          ) {
+            this.emit({ type: "thread", thread });
+            return structuredClone(thread);
+          }
+        } catch (error) {
+          thread.settings = previous;
+          thread.revision++;
+          try {
+            await this.store.writeThread(thread);
+          } finally {
+            this.emit({ type: "thread", thread });
+          }
+          throw error;
+        }
+        // Provider policies belong to the native session. Retire it before resuming
+        // so pending approvals, child work and sandbox grants cannot outlive a change.
+        const job = this.jobs.get(threadId);
+        const resume = job && !job.stopped && thread.status === "running";
+        const automaticQueue = this.automaticQueues.has(threadId);
+        const canResume = () =>
+          resume &&
+          !this.closing &&
+          (this.stopVersions.get(threadId) ?? 0) === stopVersion &&
+          !this.cancelledStarts.has(threadId);
+        if (job) {
+          job.stopped = true;
+          job.thread.pendingApprovals = undefined;
+          thread.activity = "Resuming with updated access";
+          job.process?.stop();
+        }
+        this.emit({ type: "thread", thread });
+        this.sessionGeneration++;
+        await this.sessions.clear({ threadId, projectIds: new Set([projectId]) });
+        if (job) {
+          await job.process?.done.catch(() => {});
+          await this.finish({ job, kind: canResume() ? "handover" : "stop" });
+        }
+        if (canResume()) {
+          if (automaticQueue) this.automaticQueues.add(threadId);
+          try {
+            const restored = job?.queuedDelivery?.message;
+            if (restored && thread.queuedMessages?.some((message) => message.id === restored.id))
+              return await this.run(
+                thread,
+                restored.text,
+                restored.attachments?.map((file) => file.id),
+                restored.id,
+                restored.skillId,
+              );
+            return await this.run(
+              thread,
+              [
+                "The user changed this thread's access settings. Continue only the unfinished part of the existing request with the updated permissions.",
+                "Do not repeat completed actions. Before retrying any interrupted action without a confirmed result, inspect the current files or external state to determine whether it already succeeded. Do not assume an interruption rolled back its effects.",
+                "Recent completed or interrupted steps (use the native conversation for their full results):",
+                JSON.stringify(
+                  (thread.toolActivities ?? [])
+                    .slice(-20)
+                    .map(({ title, toolName, status, endedAt }) => ({
+                      title,
+                      toolName,
+                      status,
+                      endedAt,
+                    })),
+                ),
+              ].join("\n\n"),
+              [],
+              undefined,
+              undefined,
+              true,
+            );
+          } catch (error) {
+            // Preparation can fail before runPrepared registers its replacement job.
+            // End the handover checkpoint rather than leaving an unowned running thread.
+            if (!this.jobs.has(threadId) && thread.status === "running") {
+              this.automaticQueues.delete(threadId);
+              thread.status = canResume() ? "failed" : "stopped";
+              thread.activity = undefined;
+              if (thread.status === "failed") {
+                thread.error =
+                  error instanceof Error ? error.message : "The harness could not resume.";
+                thread.errorKind = error instanceof HarnessFailureError ? error.kind : undefined;
+              }
+              thread.updatedAt = new Date().toISOString();
+              if (job?.turn && !job.turn.endedAt) job.turn.endedAt = thread.updatedAt;
+              thread.revision++;
+              try {
+                await this.store.writeThread(thread);
+              } catch {
+                thread.error = "Thread changes could not be written to disk.";
+                thread.errorKind = "storage";
+              }
+              this.emit({ type: "thread", thread });
+            }
+            throw error;
+          }
+        }
+        // Stop may arrive while the final checkpoint is being written.
+        if (job && thread.status === "running") {
+          thread.status = "stopped";
+          thread.activity = undefined;
+          if (job.turn && !job.turn.endedAt) job.turn.endedAt = new Date().toISOString();
+          thread.revision++;
+          await this.store.writeThread(thread);
+          this.emit({ type: "thread", thread });
+        }
+      } else this.emit({ type: "thread", thread });
       return structuredClone(thread);
     } finally {
       this.starting.delete(threadId);
@@ -885,7 +1025,7 @@ export class WorkspaceService {
       projectId: input.projectId,
       executionProjectId: input.executionProjectId,
       harness: input.harness,
-      settings: input.settings,
+      settings: { ...input.settings, permissionMode: input.settings?.permissionMode ?? "default" },
       title: promptThreadTitle(input.prompt),
       titleSource: "prompt",
       designIds: input.designIds,
@@ -1333,7 +1473,7 @@ export class WorkspaceService {
     thread.revision++;
     thread.error = undefined;
     thread.errorKind = undefined;
-    thread.activity = "Starting";
+    thread.activity = continuation ? "Resuming" : "Starting";
     thread.updatedAt = new Date().toISOString();
     const job: Job = {
       analytics: this.analyticsScope?.() ?? this.analytics,
@@ -1618,11 +1758,12 @@ export class WorkspaceService {
         tool.status = job.stopped ? "cancelled" : "interrupted";
         tool.endedAt = new Date().toISOString();
       }
-    job.thread.activity = undefined;
+    if (request.kind === "handover") job.thread.status = "running";
+    job.thread.activity = request.kind === "handover" ? "Resuming with updated access" : undefined;
     job.thread.pendingApprovals = undefined;
     job.thread.revision++;
     job.thread.updatedAt = new Date().toISOString();
-    if (!job.turn.endedAt) job.turn.endedAt = job.thread.updatedAt;
+    if (request.kind !== "handover" && !job.turn.endedAt) job.turn.endedAt = job.thread.updatedAt;
     const previousDoneAt = job.thread.doneAt;
     if (request.kind === "done") job.thread.doneAt = request.doneAt;
     let writeFailure: { cause: unknown } | undefined;
@@ -1698,7 +1839,11 @@ export class WorkspaceService {
 
   async stopThread(projectId: string, threadId: string) {
     this.requestThreadStop(projectId, threadId, true);
-    await this.store.updateResumes.cancel(projectId, threadId);
+    this.sessionGeneration++;
+    await Promise.all([
+      this.sessions.clear({ threadId, projectIds: new Set([projectId]) }),
+      this.store.updateResumes.cancel(projectId, threadId),
+    ]);
   }
 
   private requestThreadStop(projectId: string, threadId: string, notify: boolean) {
