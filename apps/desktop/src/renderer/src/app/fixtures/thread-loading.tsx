@@ -31,6 +31,7 @@ import { PrivacySettings } from "../../features/settings/privacy-settings";
 import { readAnalyticsState } from "../../features/settings/analytics-state";
 import { ANALYTICS_NOTICE, type AnalyticsAPI, type AnalyticsState } from "@tidy/design/analytics";
 import { ThreadCard } from "../../features/threads/thread-card";
+import { pullRequestStatus } from "../../components/pull-request-status";
 import { RemoteMachines } from "../../features/settings/remote-machines";
 import { Settings } from "../../features/settings/settings";
 import type { MachineBridge } from "../../../../shared/remote";
@@ -41,6 +42,8 @@ import { SkillPrompt } from "../../features/composer/skill-prompt";
 import type { AttachedFile } from "../../../../shared/contracts/attachments";
 import type { ProjectSetupResult } from "../../../../shared/contracts/workspace-response";
 import { useWorkspaceState } from "../use-workspace-state";
+import { NavigationScope } from "../session-state";
+import { readSidebarCache, writeSidebarCache } from "../sidebar-cache";
 
 const projectId = crypto.randomUUID();
 const timestamp = "2026-10-20T12:00:00.000Z";
@@ -58,10 +61,12 @@ function required<T>(value: T | null | undefined, label: string): T {
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => {
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
     resolve = done;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function frame(): Promise<void> {
@@ -819,6 +824,271 @@ async function runThreadLoadingTests(filter = ""): Promise<string[]> {
   );
 
   await run(
+    "cached sidebar PRs stay mounted through bootstrap and sparse refreshes",
+    async (root) => {
+      const scope = crypto.randomUUID();
+      const url = "https://github.com/owner/repo/pull/42";
+      const thread = { ...makeThread(), pullRequests: [url] };
+      const snapshot: ProjectSnapshot = {
+        project: { id: projectId, name: "Cached project", path: "/fixture", openedAt: timestamp },
+        threads: [summarizeThread(thread)],
+        designs: [],
+        folders: [],
+      };
+      writeSidebarCache({ scope, projects: [snapshot.project], activeProject: snapshot });
+      const pending = deferred<Bootstrap>();
+      const listeners = new Set<(event: DesktopEvent) => void>();
+      const errors: unknown[] = [];
+      const status = deferred<"closed">();
+      const api = {
+        bootstrap: () => pending.promise,
+        selectProject: async () => snapshot,
+        readThread: async () => thread,
+        openChatLink: async () => {},
+        pullRequestState: () => status.promise,
+        onEvent: (listener: (event: DesktopEvent) => void) => {
+          listeners.add(listener);
+          return () => {
+            listeners.delete(listener);
+          };
+        },
+      };
+      await pullRequestStatus({
+        api: { pullRequestState: async () => "merged" },
+        projectId,
+        url,
+        scope,
+      }).refresh();
+      let current: ReturnType<typeof useWorkspaceState> | undefined;
+      function Probe() {
+        const navigation = useRef(0);
+        current = useWorkspaceState({ api, navigation, onError: (error) => errors.push(error) });
+        const visible = current.activeProjectId
+          ? current.snapshots[current.activeProjectId]
+          : undefined;
+        return visible ? (
+          <ThreadSidebar
+            projectId={visible.project.id}
+            threads={visible.threads}
+            search=""
+            renderThread={(item) => (
+              <ThreadCard
+                thread={item}
+                api={api}
+                selected={false}
+                loaded={false}
+                pending={false}
+                now={Date.now()}
+                onSelect={() => {}}
+                onDone={() => {}}
+              />
+            )}
+          />
+        ) : null;
+      }
+      flushSync(() =>
+        root.render(
+          <NavigationScope value={scope}>
+            <Probe />
+          </NavigationScope>,
+        ),
+      );
+      const link = required(
+        host.querySelector<HTMLAnchorElement>(".thread-pull-requests a"),
+        "Cached PR link before bootstrap",
+      );
+      const icon = required(link.querySelector("svg"), "Cached PR icon");
+      check(current?.loading, "Bootstrap should still be pending");
+      check(icon.getAttribute("data-state") === "merged", "Cached status missing before bootstrap");
+      const sparse = { ...snapshot.threads[0], pullRequests: undefined, revision: 2 };
+      flushSync(() => {
+        for (const listener of listeners) listener({ type: "thread-summary", thread: sparse });
+      });
+      check(
+        host.querySelector(".thread-pull-requests a") === link,
+        "Sparse update removed the cached PR",
+      );
+      pending.resolve({
+        projects: [snapshot.project],
+        activeProject: { ...snapshot, threads: [sparse] },
+        harnesses: [],
+      });
+      await until(() => !current?.loading, "Refreshed workspace bootstrap");
+      check(
+        host.querySelector(".thread-pull-requests a") === link,
+        "Bootstrap replaced the cached PR link",
+      );
+      check(
+        link.querySelector("svg") === icon &&
+          icon.getAttribute("data-state") === "merged" &&
+          link.textContent?.includes("#42"),
+        "Bootstrap changed the PR contents or cleared its known colour",
+      );
+      link.focus();
+      check(
+        getComputedStyle(required(link.querySelector("span"), "PR number")).textDecorationLine ===
+          "underline",
+        "Focused PR number has no underline",
+      );
+      flushSync(() =>
+        current?.applySnapshot({ ...snapshot, threads: [{ ...sparse, revision: 3 }] }),
+      );
+      check(
+        host.querySelector(".thread-pull-requests a") === link,
+        "Snapshot refresh removed the cached PR",
+      );
+      status.resolve("closed");
+      await until(() => icon.getAttribute("data-state") === "closed", "Updated PR status");
+      check(
+        host.querySelector(".thread-pull-requests a") === link,
+        "Status update replaced the link",
+      );
+      flushSync(() =>
+        current?.applySnapshot({
+          ...snapshot,
+          threads: [{ ...sparse, revision: 4, pullRequests: [] }],
+        }),
+      );
+      check(!link.isConnected, "Explicit PR removal was ignored");
+      window.dispatchEvent(new Event("pagehide"));
+      check(
+        readSidebarCache(scope)?.activeProject?.threads[0].pullRequests?.length === 0,
+        "Reload would restore a removed PR",
+      );
+      check(errors.length === 0, "Workspace refresh failed");
+    },
+  );
+
+  await run(
+    "partial cached lists preserve complete manual order and keyboard changes",
+    async (root) => {
+      const threads = Array.from({ length: 300 }, (_, index) => ({
+        ...summarizeThread(makeThread()),
+        title: `Thread ${index}`,
+      }));
+      const key = `tidy:thread-order:${projectId}`;
+      localStorage.setItem(key, JSON.stringify(threads.map((thread) => thread.id)));
+      const render = (complete: boolean) =>
+        flushSync(() =>
+          root.render(
+            <ThreadSidebar
+              projectId={projectId}
+              threads={complete ? threads : threads.slice(0, 256)}
+              search=""
+              complete={complete}
+              renderThread={(thread, orderControls) => (
+                <ThreadCard
+                  thread={thread}
+                  selected={false}
+                  loaded={false}
+                  pending={false}
+                  now={Date.now()}
+                  orderControls={orderControls}
+                  onSelect={() => {}}
+                  onDone={() => {}}
+                />
+              )}
+            />,
+          ),
+        );
+      render(false);
+      await settle();
+      check(
+        localStorage.getItem(key) === JSON.stringify(threads.map((thread) => thread.id)),
+        "Cached hydration pruned the saved order",
+      );
+      const first = required(
+        host.querySelector<HTMLButtonElement>(".thread-select"),
+        "First cached thread",
+      );
+      flushSync(() =>
+        first.dispatchEvent(
+          new KeyboardEvent("keydown", { key: "ArrowDown", altKey: true, bubbles: true }),
+        ),
+      );
+      await settle();
+      const expected = [
+        threads[1].id,
+        threads[0].id,
+        ...threads.slice(2).map((thread) => thread.id),
+      ];
+      check(
+        localStorage.getItem(key) === JSON.stringify(expected),
+        "Reordering cached rows discarded hidden threads",
+      );
+      render(true);
+      await settle();
+      check(
+        localStorage.getItem(key) === JSON.stringify(expected),
+        "Complete hydration changed the saved order",
+      );
+      check(
+        host.querySelector<HTMLElement>(".thread-order-row")?.dataset.threadId === threads[1].id,
+        "Uncached rows jumped ahead of manual order",
+      );
+    },
+  );
+
+  for (const cleared of [false, true]) {
+    await run(`startup cache respects a ${cleared ? "cleared" : "saved"} project`, async (root) => {
+      const scope = crypto.randomUUID();
+      const project = { id: projectId, name: "Saved project", path: "/a", openedAt: timestamp };
+      const other = { ...project, id: crypto.randomUUID(), name: "Other project", path: "/b" };
+      const snapshot: ProjectSnapshot = { project, threads: [], designs: [], folders: [] };
+      const projects = [project, other];
+      const bootstrap = { projects, activeProject: { ...snapshot, project: other }, harnesses: [] };
+      writeSidebarCache({ scope, projects, activeProject: bootstrap.activeProject });
+      const expected = cleared ? null : project.id;
+      sessionStorage.setItem(`tidy:navigation:${scope}:project`, JSON.stringify(expected));
+      const pending = deferred<Bootstrap>();
+      const selected: string[] = [];
+      const api = {
+        bootstrap: () => pending.promise,
+        selectProject: async (id: string) => {
+          selected.push(id);
+          return snapshot;
+        },
+        readThread: async () => makeThread(),
+        onEvent: () => () => {},
+      };
+      let current: ReturnType<typeof useWorkspaceState> | undefined;
+      function Probe() {
+        const navigation = useRef(0);
+        current = useWorkspaceState({
+          api,
+          navigation,
+          onError: (error) => {
+            throw error;
+          },
+        });
+        return null;
+      }
+      flushSync(() =>
+        root.render(
+          <NavigationScope value={scope}>
+            <Probe />
+          </NavigationScope>,
+        ),
+      );
+      check(current?.activeProjectId === expected, "Shared cache replaced the window selection");
+      if (!cleared) {
+        flushSync(() => current?.applySnapshot(snapshot));
+        check(current?.bootstrapped && !current.loading, "Fresh snapshot did not finish startup");
+      }
+      pending.resolve(bootstrap);
+      await until(
+        () => !current?.loading && (cleared || selected.length === 1),
+        "Restore window selection",
+      );
+      check(current?.activeProjectId === expected, "Bootstrap replaced the window selection");
+      check(
+        JSON.stringify(selected) === JSON.stringify(cleared ? [] : [project.id]),
+        "Wrong project reopened",
+      );
+    });
+  }
+
+  await run(
     "failed initial discovery is retryable without inventing installation guidance",
     async (root) => {
       let fail = true;
@@ -1305,7 +1575,7 @@ async function runThreadLoadingTests(filter = ""): Promise<string[]> {
         host.querySelector<HTMLButtonElement>("[aria-label='Close project setup']"),
         "Close button",
       );
-      check(close.disabled, "Import can be dismissed before its result is known");
+      await until(() => close.disabled, "Import blocks dismissal before its result is known");
       host.querySelector("dialog")?.dispatchEvent(new Event("cancel", { cancelable: true }));
       check(closes === 0, "Escape dismissed the import");
       render(false);
@@ -3632,6 +3902,122 @@ async function runThreadLoadingTests(filter = ""): Promise<string[]> {
       await settle();
     },
   );
+
+  for (const bootstrapFails of [false, true]) {
+    await run(
+      `startup with a partial sidebar cache preserves the selected thread${bootstrapFails ? " after a failed reload" : ""}`,
+      async (root) => {
+        const { App } = await import("../app");
+        const scope = crypto.randomUUID();
+        const selected = { ...makeThread(), status: "completed" as const };
+        const cached = makeThread();
+        const project = { id: projectId, name: "Project", path: "/fixture", openedAt: timestamp };
+        const snapshot: ProjectSnapshot = {
+          project,
+          threads: [summarizeThread(cached), summarizeThread(selected)],
+          designs: [],
+          folders: [],
+        };
+        writeSidebarCache({
+          scope,
+          projects: [project],
+          activeProject: { ...snapshot, threads: [summarizeThread(cached)] },
+        });
+        sessionStorage.setItem(`tidy:navigation:${scope}:mode`, JSON.stringify("code"));
+        const selectionKey = `tidy:navigation:${scope}:threads`;
+        sessionStorage.setItem(selectionKey, JSON.stringify({ [projectId]: selected.id }));
+        const pending = deferred<Bootstrap>();
+        const harnesses: Bootstrap["harnesses"] = [{ id: "codex", name: "Codex", status: "ready" }];
+        const api: DesktopAPI = {
+          ...nativeAPI,
+          cloud: undefined,
+          browser: undefined,
+          bootstrap: () => pending.promise,
+          checkHarnesses: async () => harnesses,
+          selectProject: async () => snapshot,
+          onEvent: () => () => {},
+          onUpdate: () => () => {},
+          updateState: async () => ({ status: "unsupported" }),
+          repositoryContext: async () => ({
+            machine: "Fixture",
+            repository: false,
+            branch: null,
+            branches: [],
+          }),
+          skills: async () => ({ skills: [] }),
+          harnessDetails: async () => ({
+            models: [],
+            windows: [],
+            updatedAt: timestamp,
+            usagePage: "subscription",
+          }),
+          harnessUsage: async () => ({
+            windows: [],
+            state: "unknown",
+            updatedAt: timestamp,
+            usagePage: "subscription",
+          }),
+          warmThread: async () => {},
+          threadPorts: async () => [],
+          readThread: async (_projectId, id) => (id === selected.id ? selected : cached),
+        };
+        const machine = { id: "local" as const, label: "Fixture", status: null };
+        flushSync(() =>
+          root.render(
+            <NavigationScope value={scope}>
+              <App
+                workspaceAPI={api}
+                machine={{
+                  current: machine,
+                  machines: [machine],
+                  connected: true,
+                  switching: false,
+                  select() {},
+                  navigate() {},
+                  cancelProjectNavigation() {},
+                  projects: async () => [project],
+                  openProject: async () => {},
+                }}
+                cloud={{
+                  busy: false,
+                  error: "",
+                  state: undefined,
+                  account: undefined,
+                  signIn: async () => {},
+                  signOut: async () => {},
+                  retry() {},
+                }}
+              />
+            </NavigationScope>,
+          ),
+        );
+        await settle();
+        check(
+          sessionStorage.getItem(selectionKey) === JSON.stringify({ [projectId]: selected.id }),
+          "Partial cache cleared the selected thread before bootstrap",
+        );
+        if (bootstrapFails) {
+          pending.reject(new Error("Workspace unavailable"));
+          await settle();
+          check(
+            sessionStorage.getItem(selectionKey) === JSON.stringify({ [projectId]: selected.id }),
+            "Failed reload cleared the cached thread selection",
+          );
+          return;
+        }
+        pending.resolve({ projects: [project], activeProject: snapshot, harnesses });
+        await until(
+          () =>
+            Boolean(
+              host.querySelector(
+                `[data-thread-id="${selected.id}"] .thread-select[aria-current="true"]`,
+              ),
+            ),
+          "Selected thread after bootstrap",
+        );
+      },
+    );
+  }
 
   return passed;
 }

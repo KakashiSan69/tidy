@@ -664,9 +664,6 @@
   border-radius: 3px;
   text-decoration: none;
 }
-.thread-pull-requests .chat-web-link:hover {
-  color: var(--color-ink);
-}
 .thread-pull-requests .chat-link-icon {
   width: 13px;
   height: 13px;
