@@ -8,7 +8,19 @@ import {
   type DefaultAccess,
 } from "../features/settings/access-preferences";
 import { effectivePermissionMode, permissionModes } from "../../../shared/contracts/permissions";
+import type { PromptEditorHandle } from "../features/composer/prompt-editor";
+import { scheduleAttachmentTransfer } from "../features/composer/attachment-transfer";
 import { AnimatedHeight } from "../components/animated-height";
+import {
+  restoreDraftAttachments,
+  assertAttachmentsReady,
+} from "../features/composer/draft-attachments";
+import {
+  importMessageAttachment,
+  attachmentRetryMessage,
+  prepareMessagePaste,
+  type ClipboardMessage,
+} from "../features/threads/message-clipboard";
 import { promptThreadTitle } from "../../../shared/models/thread-naming";
 import { currentThreadNaming } from "../features/settings/thread-naming-preferences";
 import { useThreadNames } from "../features/threads/use-thread-names";
@@ -82,6 +94,7 @@ import {
   MAX_ATTACHMENT_BYTES,
   MAX_IMAGE_BYTES,
   MAX_ATTACHMENT_TOTAL_BYTES,
+  ATTACHMENT_LIMIT_MESSAGE,
 } from "../../../shared/contracts/attachments";
 import { ProjectSwitcher } from "../features/workspace/project-switcher";
 import { ProjectFiles } from "../features/workspace/project-files";
@@ -258,8 +271,34 @@ export function App({
   const uploads = useRef<Record<string, Promise<void>>>({});
   const draftsRef = useRef(drafts);
   draftsRef.current = drafts;
+  const attachmentImports = useRef(new Map<string, AbortController>());
+  const attachmentImportScope = useRef({});
+  const importsMounted = useRef(false);
+  useEffect(() => {
+    importsMounted.current = true;
+    return () => {
+      importsMounted.current = false;
+      for (const controller of attachmentImports.current.values()) controller.abort();
+      attachmentImports.current.clear();
+      if (draftCache) {
+        const cached = Object.fromEntries(
+          Object.entries(draftsRef.current).map(([key, value]) => [
+            key,
+            {
+              ...value,
+              attachments: value.attachments?.map((file) =>
+                file.importState === "pending" ? { ...file, importState: "failed" as const } : file,
+              ),
+            },
+          ]),
+        );
+        draftCache.set(machine?.current.id ?? "local", cached);
+      }
+    };
+  }, [draftCache, machine?.current.id]);
   const canvasDockHome = useRef<HTMLSpanElement>(null);
   const fileInput = useRef<HTMLInputElement>(null);
+  const promptEditor = useRef<PromptEditorHandle>(null);
   const focusComposerAfterSelection = useRef(false);
   const [error, setError] = useState<WorkspaceError | null>(null);
   const {
@@ -565,6 +604,7 @@ export function App({
     executionReady &&
     !opening &&
     !uploading[draftKey] &&
+    !draft.attachments?.some((file) => file.importState) &&
     !busy &&
     !switchingBranch &&
     !thread?.doneAt &&
@@ -821,16 +861,20 @@ export function App({
   function changePrompt(text: string, attachments?: AttachedFile[]) {
     const name = skillCommand(text)?.name;
     const skill = availableSkills.find((skill) => skill.name === name);
-    updateDraft({
-      text,
-      // Text edits can follow attachment insertion in the same event. Only recall
-      // replaces files; otherwise preserve the latest draft's attachment list.
-      ...(attachments === undefined ? {} : { attachments }),
-      skill: skill
-        ? { id: skill.id, name: skill.name, harness: selectedHarness }
-        : draft.skill?.name === name
-          ? draft.skill
-          : undefined,
+    setDrafts((state) => {
+      const latest = state[draftKey] ?? draft;
+      const next = {
+        ...latest,
+        text,
+        ...(attachments === undefined ? {} : { attachments }),
+        skill: skill
+          ? { id: skill.id, name: skill.name, harness: selectedHarness }
+          : latest.skill?.name === name
+            ? latest.skill
+            : undefined,
+      };
+      draftsRef.current = { ...draftsRef.current, [draftKey]: next };
+      return { ...state, [draftKey]: next };
     });
   }
 
@@ -1149,13 +1193,13 @@ export function App({
     const errors: string[] = [];
     for (const file of files) {
       if (attached.length >= MAX_ATTACHMENTS) {
-        errors.push("Attach up to 10 files per message.");
+        errors.push(ATTACHMENT_LIMIT_MESSAGE);
         break;
       }
       const image = ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(file.type);
       if (file.size > (image ? MAX_IMAGE_BYTES : MAX_ATTACHMENT_BYTES)) {
         errors.push(
-          `${file.name}: choose ${image ? "an image under 5 MB" : "a file under 20 MB"}.`,
+          `${file.name}: choose ${image ? `an image under ${MAX_IMAGE_BYTES / 1024 / 1024} MB` : "a file under 20 MB"}.`,
         );
         continue;
       }
@@ -1163,7 +1207,7 @@ export function App({
         attached.reduce((total, value) => total + value.size, file.size) >
         MAX_ATTACHMENT_TOTAL_BYTES
       ) {
-        errors.push("Keep attachments under 25 MB per message.");
+        errors.push(ATTACHMENT_LIMIT_MESSAGE);
         continue;
       }
       const attachment: AttachedFile = {
@@ -1235,6 +1279,91 @@ export function App({
     return pending.map(({ attachment }) => attachment);
   }
 
+  function pasteMessage(message: ClipboardMessage): AttachedFile[] {
+    if (!api || !project || thread?.doneAt || busy) return [];
+    const key = draftKey;
+    const projectId = project.id;
+    const current = draftsRef.current[key] ?? draft;
+    let prepared: ReturnType<typeof prepareMessagePaste>;
+    try {
+      prepared = prepareMessagePaste({
+        message,
+        current: current.attachments ?? [],
+        projectId,
+        machineId: machine?.current.id ?? "local",
+      });
+    } catch (cause) {
+      showToast(errorText(cause));
+      return [];
+    }
+    const next = { ...current, attachments: prepared.attachments };
+    draftsRef.current = { ...draftsRef.current, [key]: next };
+    setDrafts((state) => ({
+      ...state,
+      [key]: { ...(state[key] ?? current), attachments: next.attachments },
+    }));
+    const source =
+      message.source.machineId === (machine?.current.id ?? "local")
+        ? api
+        : machine?.machines.some((value) => value.id === message.source.machineId)
+          ? machine.api?.(message.source.machineId)
+          : undefined;
+    let importErrorShown = false;
+    for (const { file, placeholder } of prepared.imports) {
+      const controller = new AbortController();
+      attachmentImports.current.set(placeholder.id, controller);
+      const update = (file: AttachedFile) => {
+        if (!importsMounted.current) return;
+        setDrafts((state) => {
+          const latest = state[key];
+          if (!latest?.attachments?.some((item) => item.id === placeholder.id)) return state;
+          const next = {
+            ...latest,
+            attachments: latest.attachments.map((item) =>
+              item.id === placeholder.id ? file : item,
+            ),
+          };
+          draftsRef.current = { ...draftsRef.current, [key]: next };
+          return { ...state, [key]: next };
+        });
+      };
+      void scheduleAttachmentTransfer(attachmentImportScope.current, async () => {
+        if (!source)
+          throw new Error("The source machine is unavailable. Reconnect and paste again.");
+        const imported = await importMessageAttachment({
+          source,
+          target: api,
+          message,
+          file,
+          projectId,
+          signal: controller.signal,
+          isRetained: () =>
+            draftsRef.current[key]?.attachments?.some((file) => file.id === placeholder.id) ??
+            false,
+        });
+        update({ ...imported, referenceId: placeholder.id, clipboardId: placeholder.clipboardId });
+      })
+        .catch(() => {
+          if (
+            controller.signal.aborted ||
+            !importsMounted.current ||
+            !draftsRef.current[key]?.attachments?.some((file) => file.id === placeholder.id)
+          )
+            return;
+          update({ ...placeholder, importState: "failed" });
+          if (!importErrorShown) {
+            importErrorShown = true;
+            showToast("Some attachments could not load. Retry them in the attachment list.");
+          }
+        })
+        .finally(() => {
+          if (attachmentImports.current.get(placeholder.id) === controller)
+            attachmentImports.current.delete(placeholder.id);
+        });
+    }
+    return prepared.mapped;
+  }
+
   async function send(delivery: MessageDelivery = "queue") {
     if (
       (machine && (!machine.connected || machine.switching)) ||
@@ -1248,6 +1377,7 @@ export function App({
       (selectedThreadId && !thread) ||
       (!running && sendingKeys.current.has(draftKey)) ||
       uploading[draftKey] ||
+      draft.attachments?.some((file) => file.importState) ||
       busy ||
       switchingBranch ||
       thread?.doneAt ||
@@ -2203,6 +2333,7 @@ export function App({
                       projectId={project.id}
                       selected={selectedThreadId ?? null}
                       threads={threads}
+                      machineId={machine?.current.id ?? "local"}
                       active={!settingsOpen && mode === "code"}
                       api={api!}
                     />
@@ -2237,7 +2368,10 @@ export function App({
                     onDrop={(event) => {
                       if (event.dataTransfer.files.length) {
                         event.preventDefault();
-                        attachFiles(Array.from(event.dataTransfer.files));
+                        promptEditor.current?.insertAttachments(
+                          attachFiles(Array.from(event.dataTransfer.files)),
+                          { x: event.clientX, y: event.clientY },
+                        );
                       }
                     }}
                     onSubmit={(event) => {
@@ -2260,6 +2394,12 @@ export function App({
                                 options: machine.machines,
                                 onChange: (id) => {
                                   if (!project || !executionProject) return;
+                                  try {
+                                    assertAttachmentsReady(draft.attachments ?? []);
+                                  } catch (cause) {
+                                    showToast(errorText(cause));
+                                    return;
+                                  }
                                   machine.select(id, {
                                     project: executionProject,
                                     contextProjectId: project.id,
@@ -2337,11 +2477,22 @@ export function App({
                         </p>
                       )}
                       <AttachmentList
+                        key={draftKey}
                         files={draft.attachments ?? []}
+                        onRetry={
+                          thread?.doneAt || busy
+                            ? undefined
+                            : (id) => {
+                                const file = draft.attachments?.find((item) => item.id === id);
+                                const message = file && attachmentRetryMessage(file);
+                                if (message) pasteMessage(message);
+                              }
+                        }
                         onRemove={
                           thread?.doneAt
                             ? undefined
                             : (id) => {
+                                attachmentImports.current.get(id)?.abort();
                                 const file = draft.attachments?.find((item) => item.id === id);
                                 updateDraft({
                                   text: file
@@ -2375,7 +2526,9 @@ export function App({
                         hidden
                         aria-label="Attach files"
                         onChange={(event) => {
-                          attachFiles(Array.from(event.currentTarget.files ?? []));
+                          promptEditor.current?.insertAttachments(
+                            attachFiles(Array.from(event.currentTarget.files ?? [])),
+                          );
                           event.currentTarget.value = "";
                         }}
                       />
@@ -2428,6 +2581,7 @@ export function App({
                         </div>
                       )}
                       <SkillPrompt
+                        ref={promptEditor}
                         className="block w-full resize-none overflow-y-auto rounded border-0 bg-transparent px-1.5 py-2 text-sm leading-6 text-ink [field-sizing:content] min-h-[calc(1lh_+_16px)] max-h-[min(200px,40dvh)] placeholder:text-muted-ink focus:outline-none"
                         key={draftKey + selectedHarness}
                         skills={availableSkills}
@@ -2440,9 +2594,30 @@ export function App({
                         value={draft.text}
                         onChange={(text) => changePrompt(text)}
                         history={promptHistory}
-                        onRecall={(entry) => changePrompt(entry.text, entry.attachments ?? [])}
+                        onRecall={(entry) =>
+                          changePrompt(
+                            entry.text,
+                            restoreDraftAttachments({
+                              attachments: entry.attachments ?? [],
+                              isPending: (id) => {
+                                const controller = attachmentImports.current.get(id);
+                                return Boolean(controller && !controller.signal.aborted);
+                              },
+                            }),
+                          )
+                        }
                         files={draft.attachments ?? []}
                         onAttachFiles={attachFiles}
+                        onPasteMessage={pasteMessage}
+                        clipboardSource={{
+                          projectId: project.id,
+                          machineId: machine?.current.id ?? "local",
+                        }}
+                        attachmentsReady={!uploading[draftKey]}
+                        historyDisabled={
+                          Boolean(uploading[draftKey]) ||
+                          Boolean(draft.attachments?.some((file) => file.importState))
+                        }
                         placeholder={
                           thread?.doneAt
                             ? "Reopen this thread to continue…"
