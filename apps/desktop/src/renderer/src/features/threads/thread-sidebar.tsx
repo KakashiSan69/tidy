@@ -2,6 +2,7 @@ import { memo, useEffect, useMemo, useState, type ReactNode, type PointerEvent }
 import { z } from "zod";
 import { DraftThreadCard } from "./draft-thread-card";
 import { useThreadDrag } from "./use-thread-drag";
+import { useDraftSidebarMotion } from "./use-draft-sidebar-motion";
 import type { ThreadSummary } from "../../../../shared/contracts/desktop";
 
 export type ThreadOrderControls = {
@@ -120,11 +121,19 @@ export const ThreadSidebar = memo(function ThreadSidebar({
     }
   }, [projectId, order, drag.draggingId, complete]);
   const query = search.trim().toLocaleLowerCase();
-  const matches = (item: ThreadSummary) => item.title.toLocaleLowerCase().includes(query);
+  const matches = (item: ThreadSummary) =>
+    (item.title.trim() || "New thread").toLocaleLowerCase().includes(query);
   const visibleDraft = Boolean(
     draft?.text.trim() && draft.text.toLocaleLowerCase().includes(query),
   );
   const active = ordered.filter((item) => !item.doneAt && matches(item));
+  useDraftSidebarMotion({
+    list: drag.list,
+    visible: visibleDraft,
+    scope: `${projectId}:${query}`,
+    order: active.map((item) => item.id).join(":"),
+    dragging: Boolean(drag.draggingId),
+  });
   const done = roots
     .filter((item) => item.doneAt && matches(item))
     .sort((a, b) => (b.doneAt ?? "").localeCompare(a.doneAt ?? ""));
