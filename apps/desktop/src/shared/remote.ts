@@ -51,6 +51,7 @@ export const connectionStatusSchema = z.discriminatedUnion("kind", [
     target: z.string(),
     warning: z.string().optional(),
     updatePending: z.boolean().optional(),
+    capabilities: z.array(z.string()).optional(),
   }),
   z.object({
     kind: z.literal("reconnecting"),
@@ -139,6 +140,7 @@ const remoteReadOperations = new Set([
   "harness-usage",
   "harnesses",
   "read-thread",
+  "thread-tasks",
   "thread-ports",
   "warm-thread",
   "read-attachment",

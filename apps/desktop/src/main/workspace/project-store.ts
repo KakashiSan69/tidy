@@ -35,9 +35,12 @@ import { ThreadAuthority } from "./thread-authority";
 import { ThreadWorktrees } from "../repository/thread-worktrees";
 import { threadModeSchema, type ThreadMode } from "../../shared/contracts/thread-workspace";
 import { UpdateResumes } from "./update-resumes";
+import { QueueAuthority } from "./queue-authority";
+import { ProjectIdentity } from "./project-identity";
+import type { QueuedMessage } from "../../shared/contracts/message-queue";
 import { toolLogSize } from "../../shared/contracts/tool-activity";
 import { readLocalFile } from "../platform/local-files";
-import { CloudCompute } from "../cloud/cloud-compute";
+import { CloudCompute, CloudComputeBusyError } from "../cloud/cloud-compute";
 import {
   designFileStamp,
   summarizeDesignFile,
@@ -70,9 +73,28 @@ const registrySchema = z.object({
 function missing(error: unknown) {
   return (error as NodeJS.ErrnoException).code === "ENOENT";
 }
+
+async function readMetadata<T>(files: string[], read: (file: string) => Promise<T>) {
+  const pending = files.entries();
+  const results = new Array<T>(files.length);
+  await Promise.all(
+    Array.from({ length: Math.min(4, files.length) }, async () => {
+      for (const [index, file] of pending) results[index] = await read(file);
+    }),
+  );
+  return results;
+}
+
+export class DesignVersionConflictError extends Error {
+  constructor() {
+    super("This design changed on disk. The latest version has been loaded; try your edit again.");
+  }
+}
+
 /** Project directories are explicitly selected on the host, then addressed by IDs. */
 export class ProjectStore {
   readonly processState: PrivateState;
+  readonly orchestrationDirectory: string;
   analytics?: (event: import("@tidy/design/analytics").AnalyticsEvent) => void;
   private registry: z.infer<typeof registrySchema> = {
     version: 1,
@@ -93,6 +115,8 @@ export class ProjectStore {
   private authority: ThreadAuthority;
   readonly updateResumes: UpdateResumes;
   readonly worktrees: ThreadWorktrees;
+  private queueAuthority: QueueAuthority;
+  private projectIdentity: ProjectIdentity;
   constructor(
     private directory: string,
     private assetBase = "/__tidy/assets",
@@ -101,7 +125,10 @@ export class ProjectStore {
     this.authority = new ThreadAuthority(join(directory, "thread-authority"));
     this.worktrees = new ThreadWorktrees(join(directory, "worktrees"));
     this.updateResumes = new UpdateResumes(directory);
+    this.queueAuthority = new QueueAuthority(join(directory, "queue-authority"));
+    this.projectIdentity = new ProjectIdentity(join(directory, "project-identities"));
     this.processState = new PrivateState(join(directory, "process-state"));
+    this.orchestrationDirectory = join(directory, "orchestration");
   }
 
   private storageClaim(path: string) {
@@ -131,6 +158,8 @@ export class ProjectStore {
   async initialize() {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     await this.authority.initialize();
+    await this.queueAuthority.initialize();
+    await this.projectIdentity.initialize();
     await this.processState.initialize();
     try {
       this.registry = registrySchema.parse(
@@ -138,6 +167,19 @@ export class ProjectStore {
       );
     } catch (error) {
       if (!missing(error)) throw new Error("The local project registry could not be read.");
+    }
+    const verified: typeof this.registry.projects = [];
+    for (const project of this.registry.projects)
+      if (await this.projectIdentity.claim(project.id, project.path)) verified.push(project);
+    if (verified.length !== this.registry.projects.length) {
+      this.registry = {
+        ...this.registry,
+        projects: verified,
+        activeProjectId: verified.some((project) => project.id === this.registry.activeProjectId)
+          ? this.registry.activeProjectId
+          : null,
+      };
+      await this.writeRegistry();
     }
   }
 
@@ -194,19 +236,13 @@ export class ProjectStore {
           .object({ version: z.literal(1), id })
           .parse(await this.read(metadataPath)).id;
       }
-      const previous = this.projects.find((item) => item.id === project.id);
-      project.threadMode = previous?.threadMode;
-      if (previous && previous.path !== path) {
-        const previousPath = await realpath(previous.path).catch((error) => {
-          if (missing(error)) return null;
-          throw error;
-        });
-        if (previousPath && previousPath !== path) {
-          // A copied identity must not redirect a registered project's active jobs or data.
+      if (!(await this.projectIdentity.claim(project.id, path))) {
+        do {
           project.id = randomUUID();
-          await this.atomicWrite(metadataPath, { version: 1, id: project.id });
-        }
+        } while (!(await this.projectIdentity.claim(project.id, path)));
+        await this.atomicWrite(metadataPath, { version: 1, id: project.id });
       }
+      project.threadMode = this.projects.find((item) => item.id === project.id)?.threadMode;
       if (!cloudName && this.projects.some((project) => project.path === path && project.cloud))
         throw new Error("Open this cloud workspace through your account instead.");
       const previousRegistry = this.registry;
@@ -387,7 +423,12 @@ export class ProjectStore {
       (/^[a-z0-9]{1,12}$/i.test(extname(safeName).slice(1))
         ? extname(safeName).slice(1).toLowerCase()
         : "bin");
-    const attachment = { id: randomUUID(), name: safeName, mimeType, size: bytes.length };
+    const attachment = {
+      id: randomUUID(),
+      name: safeName,
+      mimeType,
+      size: bytes.length,
+    };
     const directory = await this.storagePath(projectId, "attachments");
     await writeFile(join(directory, `${attachment.id}.file.${suffix}`), bytes, {
       mode: 0o600,
@@ -537,6 +578,23 @@ export class ProjectStore {
     return next;
   }
 
+  trustQueuedMessage(thread: Thread, message: QueuedMessage) {
+    return this.queueAuthority.trust(this.project(thread.projectId).path, thread, message);
+  }
+
+  editQueuedMessage(thread: Thread, previous: QueuedMessage, next: QueuedMessage) {
+    return this.queueAuthority.edit(this.project(thread.projectId).path, thread, previous, next);
+  }
+
+  assertQueuedMessage(thread: Thread, message: QueuedMessage, allowUntrusted = false) {
+    return this.queueAuthority.verify(
+      this.project(thread.projectId).path,
+      thread,
+      message,
+      allowUntrusted,
+    );
+  }
+
   writeThread(thread: Thread) {
     const value = threadSchema.parse(thread);
     const portable = { ...value };
@@ -679,7 +737,9 @@ export class ProjectStore {
   }
   async designStamp(projectId: string, designId: string) {
     return designFileStamp(
-      await stat(await this.storagePath(projectId, "designs", designId), { bigint: true }),
+      await stat(await this.storagePath(projectId, "designs", designId), {
+        bigint: true,
+      }),
     );
   }
   async designIdentity(projectId: string, designId: string) {
@@ -731,25 +791,27 @@ export class ProjectStore {
     return this.readDesign(projectId, designId);
   }
 
-  async updateDesign(input: {
-    projectId: string;
-    designId: string;
-    expectedVersion: string;
-    document?: unknown;
-    name?: string;
-    folderId?: string | null;
-  }) {
-    const document = input.document === undefined ? undefined : parseDesignDocument(input.document);
+  async updateDesign(
+    input: {
+      projectId: string;
+      designId: string;
+      expectedVersion: string;
+      beforeWrite?: () => Promise<void>;
+      signal?: AbortSignal;
+      document?: unknown;
+      name?: string;
+      folderId?: string | null;
+    },
+    options: { includeAssets?: boolean; onCommitAttempt?: () => void } = {},
+  ) {
+    const document = input.document === undefined ? undefined : structuredClone(input.document);
     const name =
       input.name === undefined ? undefined : z.string().trim().min(1).max(120).parse(input.name);
     let result!: LocalDesign;
     const next = this.writes.then(async () => {
       const current = await this.readDesign(input.projectId, input.designId, false);
       if (current.archivedAt) throw new Error("Restore this archived design before editing it.");
-      if (current.version !== input.expectedVersion)
-        throw new Error(
-          "This design changed on disk. The latest version has been loaded; try your edit again.",
-        );
+      if (current.version !== input.expectedVersion) throw new DesignVersionConflictError();
       if (input.folderId !== undefined && input.folderId !== null)
         await this.readFolder(input.projectId, input.folderId);
       const data = {
@@ -760,8 +822,21 @@ export class ProjectStore {
         document: document ?? current.document,
       };
       const path = await this.storagePath(input.projectId, "designs", input.designId);
-      await this.writeAtomicFile(path, JSON.stringify(data, null, 2));
-      result = await this.readDesign(input.projectId, input.designId);
+      const encoded = await projectCompute.encodeDesign(data);
+      const latest = await this.readDesign(input.projectId, input.designId, false);
+      if (latest.version !== input.expectedVersion) throw new DesignVersionConflictError();
+      await this.writeAtomicFile(path, encoded, async () => {
+        await input.beforeWrite?.();
+        const committing = await this.readDesign(input.projectId, input.designId, false);
+        if (committing.version !== input.expectedVersion) throw new DesignVersionConflictError();
+        input.signal?.throwIfAborted();
+        options.onCommitAttempt?.();
+      });
+      result = await this.readDesign(
+        input.projectId,
+        input.designId,
+        options.includeAssets ?? true,
+      );
     });
     this.writes = next.catch(() => {});
     await next;
@@ -875,24 +950,23 @@ export class ProjectStore {
     const files = (await readdir(directory)).filter(
       (name) => id.safeParse(name.replace(/\.json$/, "")).success && name.endsWith(".json"),
     );
-    const designs = await Promise.all(
-      files.map(async (file) => {
-        try {
-          const design = await this.designSummary(projectId, file.slice(0, -5));
-          return {
-            id: design.id,
-            name: design.name,
-            folderId: design.folderId,
-            archivedAt: design.archivedAt,
-            nodeCount: design.nodeCount,
-            path: design.path,
-            updatedAt: design.updatedAt,
-          };
-        } catch {
-          return null;
-        }
-      }),
-    );
+    const designs = await readMetadata(files, async (file) => {
+      try {
+        const design = await this.designSummary(projectId, file.slice(0, -5));
+        return {
+          id: design.id,
+          name: design.name,
+          folderId: design.folderId,
+          archivedAt: design.archivedAt,
+          nodeCount: design.nodeCount,
+          path: design.path,
+          updatedAt: design.updatedAt,
+        };
+      } catch (error) {
+        if (error instanceof CloudComputeBusyError) throw error;
+        return null;
+      }
+    });
     return designs
       .filter((value) => value !== null)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -928,13 +1002,19 @@ export class ProjectStore {
 
   async createFolder(projectId: string, name: string) {
     const folderId = randomUUID();
-    const value = { id: folderId, name: z.string().trim().min(1).max(120).parse(name) };
+    const value = {
+      id: folderId,
+      name: z.string().trim().min(1).max(120).parse(name),
+    };
     await this.atomicWrite(() => this.storagePath(projectId, "folders", folderId), value);
     return this.readFolder(projectId, folderId);
   }
 
   async renameFolder(projectId: string, folderId: string, name: string) {
-    const value = { id: folderId, name: z.string().trim().min(1).max(120).parse(name) };
+    const value = {
+      id: folderId,
+      name: z.string().trim().min(1).max(120).parse(name),
+    };
     await this.atomicWrite(async () => {
       await this.readFolder(projectId, folderId);
       return this.storagePath(projectId, "folders", folderId);
@@ -947,15 +1027,14 @@ export class ProjectStore {
     const files = (await readdir(directory)).filter(
       (name) => name.endsWith(".json") && id.safeParse(name.slice(0, -5)).success,
     );
-    const threads = await Promise.all(
-      files.map(async (file) => {
-        try {
-          return await this.readThreadSummary(projectId, file.slice(0, -5));
-        } catch {
-          return null;
-        }
-      }),
-    );
+    const threads = await readMetadata(files, async (file) => {
+      try {
+        return await this.readThreadSummary(projectId, file.slice(0, -5));
+      } catch (error) {
+        if (error instanceof CloudComputeBusyError) throw error;
+        return null;
+      }
+    });
     return threads
       .filter((value) => value !== null)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
@@ -984,7 +1063,10 @@ export class ProjectStore {
           })
         : summarizeThread(await this.readThread(projectId, threadId));
     if (designFileStamp(await lstat(path, { bigint: true })) === stamp) {
-      this.threadSummaryCache.set(path, { stamp, summary: structuredClone(summary) });
+      this.threadSummaryCache.set(path, {
+        stamp,
+        summary: structuredClone(summary),
+      });
       while (this.threadSummaryCache.size > 1000) {
         const oldest = this.threadSummaryCache.keys().next().value;
         if (oldest === undefined) break;
@@ -1043,12 +1125,17 @@ export class ProjectStore {
     return this.atomicWrite(join(this.directory, "projects.json"), this.registry);
   }
 
-  private async writeAtomicFile(path: string, json: string | Uint8Array) {
+  private async writeAtomicFile(
+    path: string,
+    json: string | Uint8Array,
+    beforeRename?: () => Promise<void>,
+  ) {
     if ((typeof json === "string" ? Buffer.byteLength(json) : json.byteLength) > 16 * 1024 * 1024)
       throw new Error("The local project file reached its size limit.");
     const temporary = `${path}.${randomUUID()}.tmp`;
     try {
       await writeFile(temporary, json, { mode: 0o600, flag: "wx" });
+      await beforeRename?.();
       await rename(temporary, path);
     } finally {
       await rm(temporary, { force: true });

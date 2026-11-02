@@ -89,6 +89,7 @@ import { DesktopShell, SidebarToggle, SidebarNavigation } from "./desktop-shell"
 import { Settings } from "../features/settings/settings";
 import { Conversations, prepareConversation } from "../features/threads/conversations";
 import { ThreadDesignDock } from "../features/designs/thread-preview/dock";
+import { ThreadWorkPermission } from "../features/threads/thread-work-permission";
 import { ThreadSidebar, type ThreadOrderControls } from "../features/threads/thread-sidebar";
 import { ApprovalRequests } from "../features/threads/approval-requests";
 import {
@@ -169,6 +170,19 @@ export function App({
   cloud: CloudConnection;
 }) {
   const api = machine ? workspaceAPI : window.tidy;
+  const remoteOrchestrationSupport =
+    machine?.current.status?.kind === "connected"
+      ? machine.current.status.capabilities?.includes("agent-orchestration") === true
+      : undefined;
+  const [lastOrchestrationSupport, setLastOrchestrationSupport] = useState(false);
+  useEffect(() => {
+    if (remoteOrchestrationSupport !== undefined)
+      setLastOrchestrationSupport(remoteOrchestrationSupport);
+  }, [remoteOrchestrationSupport]);
+  const orchestrationSupported =
+    !machine ||
+    machine.current.id === "local" ||
+    (remoteOrchestrationSupport ?? lastOrchestrationSupport);
   const cloudLibrary = useMemo(
     () => ({ state: cloud.state, account: cloud.account }),
     [cloud.state, cloud.account],
@@ -1816,6 +1830,20 @@ export function App({
     thread?.status === "completed" &&
     (selectedSummary?.messageCount === undefined ||
       thread.messages.length === selectedSummary.messageCount);
+  const childApprovals = useMemo(() => {
+    const counts = new Map<string, { count: number; threadId: string }>();
+    for (const item of snapshot?.threads ?? []) {
+      if (item.parentThreadId && item.pendingApprovalCount) {
+        const previous = counts.get(item.parentThreadId);
+        counts.set(item.parentThreadId, {
+          count: (previous?.count ?? 0) + item.pendingApprovalCount,
+          threadId: previous?.threadId ?? item.id,
+        });
+      }
+    }
+    return counts;
+  }, [snapshot?.threads]);
+  const sidebarThreadId = selectedSummary?.parentThreadId ?? selectedThreadId;
   const renderThread = useCallback(
     (item: ThreadSummary, orderControls?: ThreadOrderControls) => (
       <ThreadCard
@@ -1824,8 +1852,17 @@ export function App({
           threadNameOverrides[item.id] ? { ...item, title: threadNameOverrides[item.id] } : item
         }
         onRenameRequested={() => setEditingThreadName(item.id)}
+        childApprovalCount={childApprovals.get(item.id)?.count}
+        onOpenChildApproval={
+          childApprovals.has(item.id)
+            ? () => {
+                const approval = childApprovals.get(item.id);
+                if (approval) selectThread(item.projectId, approval.threadId);
+              }
+            : undefined
+        }
         orderControls={orderControls}
-        selected={mode === "code" && selectedThreadId === item.id}
+        selected={mode === "code" && sidebarThreadId === item.id}
         loaded={selectedThreadId === item.id && selectedThreadLoaded}
         now={now}
         pending={Boolean(updatingDone[item.id] || settingsPending[item.id])}
@@ -1846,6 +1883,8 @@ export function App({
     ),
     [
       selectedThreadId,
+      sidebarThreadId,
+      childApprovals,
       selectedThreadLoaded,
       api,
       mode,
@@ -2413,6 +2452,16 @@ export function App({
                           New thread
                         </h1>
                       )}
+                      {orchestrationSupported &&
+                        api &&
+                        selectedSummary &&
+                        !selectedSummary.parentThreadId && (
+                          <ThreadWorkPermission
+                            key={selectedSummary.id}
+                            api={api}
+                            thread={selectedSummary}
+                          />
+                        )}
                       {thread?.doneAt && (
                         <Button
                           className="quiet-button thread-heading-action shrink-0"
@@ -2474,6 +2523,10 @@ export function App({
                       machineId={machine?.current.id ?? "local"}
                       active={!settingsOpen && mode === "code"}
                       api={api!}
+                      summaries={snapshot?.threads}
+                      onOpenThread={selectThread}
+                      connected={machine ? machine.connected : true}
+                      orchestrationSupported={orchestrationSupported}
                     />
                   </BrowserNavigationContext>
                   {thread?.pendingApprovals?.length && api ? (

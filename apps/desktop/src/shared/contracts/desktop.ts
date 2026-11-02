@@ -105,7 +105,11 @@ export const storedThreadSchema = z.object({
   updatedAt: z.string().datetime(),
 });
 
+export const threadMessageSourceSchema = z.object({ threadId: z.uuid() }).strict();
 export const liveThreadSchema = storedThreadSchema.extend({
+  messageSources: z.record(z.uuid(), threadMessageSourceSchema).optional(),
+  parentThreadId: z.string().uuid().optional(),
+  acceptsThreadWork: z.boolean().optional(),
   /** Live requests only. Never serialized to thread storage or replayed after restart. */
   pendingApprovals: z.array(approvalRequestSchema).optional(),
   /** A live, scoped request to reveal a design; never restored from portable thread JSON. */
@@ -114,6 +118,7 @@ export const liveThreadSchema = storedThreadSchema.extend({
 export const threadSummarySchema = liveThreadSchema
   .omit({
     messages: true,
+    messageSources: true,
     sessionId: true,
     toolActivities: true,
     pendingApprovals: true,
@@ -123,6 +128,7 @@ export const threadSummarySchema = liveThreadSchema
   })
   .extend({
     pendingApprovalCount: z.number().int().nonnegative().optional(),
+    taskSequence: z.number().int().nonnegative().optional(),
     preview: z.string().optional(),
     messageCount: z.number().int().nonnegative().optional(),
     queuedMessageCount: z.number().int().nonnegative().optional(),
@@ -273,6 +279,11 @@ export type DesktopAPI = {
   renameThread(projectId: string, threadId: string, title: string): Promise<Thread>;
   regenerateThreadTitle(projectId: string, threadId: string, naming: ThreadNaming): Promise<Thread>;
   readThread(projectId: string, threadId: string): Promise<Thread>;
+  setThreadWorkPermission?(projectId: string, threadId: string, enabled: boolean): Promise<Thread>;
+  cancelThreadTask?(projectId: string, threadId: string, taskId: string): Promise<void>;
+  readThreadTasks?(
+    input: import("./thread-tasks").ThreadTasksRequest,
+  ): Promise<import("./thread-tasks").ThreadTasks>;
   startThread(input: {
     threadId?: string;
     messageId?: string;
