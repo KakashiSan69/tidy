@@ -474,6 +474,17 @@ export function App({
       onEvent: api.onEvent,
     };
   }, [api, repositoryOwnerId, repositoryThreadId]);
+  const mobileAPI = useMemo(() => {
+    const mobile = api?.mobile;
+    if (!mobile) return undefined;
+    const scope = { threadId: repositoryThreadId, threadProjectId: repositoryOwnerId };
+    return {
+      ...mobile,
+      state: (input: Parameters<typeof mobile.state>[0]) => mobile.state({ ...input, ...scope }),
+      command: (input: Parameters<typeof mobile.command>[0]) =>
+        mobile.command({ ...input, ...scope }),
+    };
+  }, [api, repositoryOwnerId, repositoryThreadId]);
   const localBrowserDrafts = useRef<BrowserDraftCache>(new Map());
   const draftBrowserIds = browserDraftCache ?? localBrowserDrafts.current;
   const browserDraftKey = draftKeyForBrowser({
@@ -2418,7 +2429,9 @@ export function App({
                 hidden={mode !== "code"}
                 className="project-workspace bg-panel surfaces-workspace"
                 data-panel-open={Boolean(
-                  repositoryOpen && surfaceProject && (repositoryAPI || api?.browser),
+                  repositoryOpen &&
+                  surfaceProject &&
+                  (repositoryAPI || api?.browser || api?.mobile),
                 )}
               >
                 <div
@@ -2495,24 +2508,26 @@ export function App({
                         />
                       </div>
                     )}
-                    {surfaceProject && (repositoryAPI || api?.browser) && !repositoryOpen && (
-                      <Button
-                        id="workspace-panel-trigger"
-                        className="quiet-button workspace-panel-trigger"
-                        aria-label="Open workspace panel"
-                        title="Open workspace panel"
-                        aria-controls="workspace-side-panel"
-                        aria-expanded={false}
-                        onPointerEnter={() => void WorkspaceSurfaces.preload().catch(() => {})}
-                        onFocus={() => void WorkspaceSurfaces.preload().catch(() => {})}
-                        onClick={() => {
-                          setRepositoryMounted(true);
-                          setRepositoryOpen(true);
-                        }}
-                      >
-                        <RepositoryIcon name="panel" />
-                      </Button>
-                    )}
+                    {surfaceProject &&
+                      (repositoryAPI || api?.browser || api?.mobile) &&
+                      !repositoryOpen && (
+                        <Button
+                          id="workspace-panel-trigger"
+                          className="quiet-button workspace-panel-trigger"
+                          aria-label="Open workspace panel"
+                          title="Open workspace panel"
+                          aria-controls="workspace-side-panel"
+                          aria-expanded={false}
+                          onPointerEnter={() => void WorkspaceSurfaces.preload().catch(() => {})}
+                          onFocus={() => void WorkspaceSurfaces.preload().catch(() => {})}
+                          onClick={() => {
+                            setRepositoryMounted(true);
+                            setRepositoryOpen(true);
+                          }}
+                        >
+                          <RepositoryIcon name="panel" />
+                        </Button>
+                      )}
                   </div>
                   <BrowserNavigationContext value={openBrowserLink}>
                     <Conversations
@@ -3027,36 +3042,57 @@ export function App({
                     />
                   )}
                 </div>
-                {surfaceProject && (repositoryAPI || api?.browser) && repositoryMounted && (
-                  <WorkspaceSurfaces
-                    key={`${surfaceProject.id}:${selectedWorktree?.path ?? "local"}`}
-                    projectId={surfaceProject.id}
-                    repositoryAPI={repositoryAPI ?? undefined}
-                    open={repositoryOpen}
-                    active={!settingsOpen && mode === "code" && repositoryOpen}
-                    request={
-                      surfaceRequest?.scope ===
-                      `${browserScope?.projectId}:${browserScope?.threadId}`
-                        ? surfaceRequest
-                        : undefined
-                    }
-                    browser={
-                      api?.browser && browserScope
-                        ? {
-                            api: api.browser,
-                            scope: browserScope,
-                            requestedURL: browserRequest,
-                            connected: !machine || machine.connected,
-                            machineLabel: machine?.current.label ?? "This machine",
-                          }
-                        : undefined
-                    }
-                    onClose={() => {
-                      setRepositoryOpen(false);
-                      setBrowserRequest(undefined);
-                    }}
-                  />
-                )}
+                {surfaceProject &&
+                  (repositoryAPI || api?.browser || api?.mobile) &&
+                  repositoryMounted && (
+                    <WorkspaceSurfaces
+                      key={`${surfaceProject.id}:${selectedWorktree?.path ?? "local"}`}
+                      projectId={surfaceProject.id}
+                      repositoryAPI={repositoryAPI ?? undefined}
+                      mobile={
+                        mobileAPI
+                          ? {
+                              api: mobileAPI,
+                              connected: !machine || machine.connected,
+                              onOpenLink: (url) => {
+                                void api
+                                  ?.openChatLink(surfaceProject.id, url)
+                                  .catch((error: unknown) =>
+                                    showToast(
+                                      error instanceof Error
+                                        ? error.message
+                                        : "Could not open setup instructions.",
+                                    ),
+                                  );
+                              },
+                            }
+                          : undefined
+                      }
+                      open={repositoryOpen}
+                      active={!settingsOpen && mode === "code" && repositoryOpen}
+                      request={
+                        surfaceRequest?.scope ===
+                        `${browserScope?.projectId}:${browserScope?.threadId}`
+                          ? surfaceRequest
+                          : undefined
+                      }
+                      browser={
+                        api?.browser && browserScope
+                          ? {
+                              api: api.browser,
+                              scope: browserScope,
+                              requestedURL: browserRequest,
+                              connected: !machine || machine.connected,
+                              machineLabel: machine?.current.label ?? "This machine",
+                            }
+                          : undefined
+                      }
+                      onClose={() => {
+                        setRepositoryOpen(false);
+                        setBrowserRequest(undefined);
+                      }}
+                    />
+                  )}
               </section>
             </>
           )}
