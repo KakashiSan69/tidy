@@ -2498,6 +2498,7 @@ export function App({
                               : undefined
                           }
                           branchDisabled={Boolean(selectedWorktree)}
+                          branchPlacement="bottom"
                           machine={machine ? { label: machine.current.label } : undefined}
                           execution={executionContext}
                           designs={snapshot.designs}
