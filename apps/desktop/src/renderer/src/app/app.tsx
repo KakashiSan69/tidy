@@ -3114,6 +3114,10 @@ export function App({
             home={terminalHome}
             fullscreen={terminalFullscreen}
             onFullscreenChange={setTerminalFullscreen}
+            onOpenRemoteSettings={() => {
+              setSettingsPage("remote");
+              setSettingsOpen(true);
+            }}
           />
         )}
       </main>

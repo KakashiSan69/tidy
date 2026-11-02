@@ -63,6 +63,7 @@ export class RemoteClient {
     }
   >();
   private retryTimer?: ReturnType<typeof setTimeout>;
+  private upgradeOutcome?: Exclude<NonNullable<PreparedHost["backendUpdate"]>, { kind: "ready" }>;
   private heartbeat?: ReturnType<typeof setInterval>;
   private controller?: AbortController;
   private ssh?: SshSession;
@@ -609,6 +610,7 @@ export class RemoteClient {
   }
   start(update = false) {
     if (this.closed || this.controller) return;
+    if (update) this.upgradeOutcome = undefined;
     clearTimeout(this.retryTimer);
     const controller = new AbortController();
     this.controller = controller;
@@ -619,7 +621,20 @@ export class RemoteClient {
     });
   }
   private async connect(controller: AbortController, update = false) {
-    const connection = await this.prepare(controller.signal, update);
+    let connection: RemoteConnection;
+    try {
+      connection = await this.prepare(controller.signal, update);
+    } catch (error) {
+      const failure = remoteFailure(error);
+      if (
+        update &&
+        this.controller === controller &&
+        !controller.signal.aborted &&
+        (failure.kind === "setup" || failure.kind === "unavailable")
+      )
+        this.upgradeOutcome = { kind: "failed", message: failure.message.slice(0, 2048) };
+      throw error;
+    }
     if (controller.signal.aborted) {
       connection.close();
       return;
@@ -631,6 +646,10 @@ export class RemoteClient {
         "Backend identity changed. Verify this machine before reconnecting.",
       );
     }
+    const backendUpdate =
+      connection.host.backendUpdate ??
+      (connection.host.updatePending ? this.upgradeOutcome : undefined);
+    this.upgradeOutcome = backendUpdate?.kind === "ready" ? undefined : backendUpdate;
     try {
       await this.options.connected(connection.host.hostId);
     } catch (error) {
@@ -728,8 +747,8 @@ export class RemoteClient {
           this.recoveryWarning =
             [
               connection.host.persistenceWarning,
-              connection.host.updatePending
-                ? "A backend update is available. Finish active runs, then choose Update backend in Settings → Remote machines."
+              !backendUpdate && connection.host.updatePending
+                ? "A backend update is available. Finish active runs and close preview browser tabs and terminals, then choose Update backend in Settings → Remote machines."
                 : undefined,
             ]
               .filter(Boolean)
@@ -748,6 +767,7 @@ export class RemoteClient {
                 target: this.options.machine.target,
                 updatePending: connection.host.updatePending,
                 capabilities: this.capabilities,
+                backendUpdate,
                 ...(this.recoveryWarning ? { warning: this.recoveryWarning } : {}),
               });
             })

@@ -22,6 +22,7 @@ export function TerminalSurface({
   theme,
   onTitle,
   copy,
+  onOpenRemoteSettings,
 }: {
   api: TerminalAPI;
   projectId: string;
@@ -34,6 +35,7 @@ export function TerminalSurface({
   fontSize: number;
   theme: ITheme;
   copy?(text: string): Promise<void>;
+  onOpenRemoteSettings?(): void;
 }) {
   const host = useRef<HTMLDivElement>(null);
   const preview = useRef<HTMLCanvasElement | undefined>(undefined);
@@ -60,6 +62,7 @@ export function TerminalSurface({
   }, [onTitle]);
   const [status, setStatus] = useState("Opening terminal…");
   const [exited, setExited] = useState(false);
+  const [needsBackendUpdate, setNeedsBackendUpdate] = useState(false);
   const [restarting, setRestarting] = useState(false);
   const [attempt, setAttempt] = useState(0);
   const reconnect = useRef<() => void>(() => {});
@@ -208,6 +211,9 @@ export function TerminalSurface({
               if (disposed) return;
               if (output.kind === "error" || output.kind === "disconnected") {
                 connected = false;
+                setNeedsBackendUpdate(
+                  output.kind === "error" && output.code === "backend-update-required",
+                );
                 setStatus(output.message);
                 return;
               }
@@ -222,6 +228,7 @@ export function TerminalSurface({
                 return;
               }
               if (output.kind === "snapshot") {
+                setNeedsBackendUpdate(false);
                 session.current = output.sessionId;
                 sequence = output.sequence;
                 replaying = true;
@@ -448,7 +455,9 @@ export function TerminalSurface({
             className="quiet-button"
             disabled={restarting}
             onClick={() => {
-              if (exited) {
+              if (needsBackendUpdate && onOpenRemoteSettings) {
+                onOpenRemoteSettings();
+              } else if (exited) {
                 const id = session.current;
                 setRestarting(true);
                 setStatus("Starting a new shell…");
@@ -465,7 +474,11 @@ export function TerminalSurface({
               else setAttempt((value) => value + 1);
             }}
           >
-            {exited ? "New shell" : "Reconnect"}
+            {needsBackendUpdate && onOpenRemoteSettings
+              ? "Open settings"
+              : exited
+                ? "New shell"
+                : "Reconnect"}
           </Button>
         </div>
       )}

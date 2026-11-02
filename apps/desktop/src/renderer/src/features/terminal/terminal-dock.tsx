@@ -68,6 +68,7 @@ export function TerminalDock({
   home,
   fullscreen,
   onFullscreenChange,
+  onOpenRemoteSettings,
 }: {
   api: DesktopAPI;
   projects: Project[];
@@ -79,6 +80,7 @@ export function TerminalDock({
   home: HTMLElement | null;
   fullscreen: boolean;
   onFullscreenChange(value: boolean): void;
+  onOpenRemoteSettings?(): void;
 }) {
   const theme = useSyncExternalStore(subscribeTerminalTheme, currentTerminalTheme);
   const fontSize = useSyncExternalStore(subscribeTerminalFontSize, currentTerminalFontSize);
@@ -428,6 +430,7 @@ export function TerminalDock({
               <TerminalSurface
                 key={tab.id}
                 api={api.terminal!}
+                onOpenRemoteSettings={onOpenRemoteSettings}
                 projectId={tab.projectId}
                 terminalId={tab.id}
                 threadId={tab.threadId}

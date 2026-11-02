@@ -52,8 +52,10 @@ export function remoteTerminal(
       if (!capabilities?.includes(scope.terminalId ? "terminal-tabs-v1" : "terminal-v1")) {
         receive({
           kind: "error",
-          message:
-            "Update Tidy's backend on this machine to use terminals. Finish active work and reconnect the machine.",
+          code: next.host.managed ? "backend-update-required" : undefined,
+          message: next.host.managed
+            ? "To use terminals, finish active runs and close preview browser tabs, then choose Update backend in Settings → Remote machines."
+            : "This backend is managed externally. Ask its operator to update it to use terminals.",
         });
         return;
       }
