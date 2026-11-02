@@ -151,33 +151,6 @@
   padding: 6px 10px;
   border-bottom: 1px solid var(--repository-hairline);
 }
-.repository-navigation-actions,
-.repository-view-options {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  min-width: 0;
-}
-.repository-navigation-actions {
-  flex-shrink: 0;
-}
-.repository-view-options > button {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  min-height: 28px;
-  padding: 4px 8px;
-  border-radius: 5px;
-  font-size: 12px;
-  color: var(--color-muted-ink);
-  white-space: nowrap;
-}
-.repository-view-options > button[aria-pressed="true"] {
-  background: var(--color-subtle-fill);
-  color: var(--color-ink);
-  font-weight: 500;
-}
-.repository-view-count,
 .repository-folder-count {
   min-width: 18px;
   padding-inline: 4px;
@@ -186,10 +159,6 @@
   font-size: 10px;
   font-variant-numeric: tabular-nums;
   text-align: center;
-}
-.repository-view-count {
-  background: var(--color-panel);
-  line-height: 17px;
 }
 .repository-folder-count {
   margin-left: auto;
@@ -681,4 +650,63 @@
 .repository-browser .hljs-comment,
 .repository-browser .hljs-quote {
   color: var(--color-muted-ink);
+}
+
+.repository-review {
+  --repository-number-width: 44px;
+  --repository-added: light-dark(#217a49, #51bd91);
+  --repository-removed: light-dark(#b13f4a, #e5818e);
+  --repository-added-surface: color-mix(in srgb, var(--repository-added) 7%, var(--color-surface));
+  --repository-removed-surface: color-mix(
+    in srgb,
+    var(--repository-removed) 7%,
+    var(--color-surface)
+  );
+}
+.repository-review-body .repository-code-row {
+  border-left: 0;
+}
+.repository-review-body .repository-line-number {
+  position: static;
+  padding-right: 12px;
+  color: color-mix(in srgb, var(--color-ink) 45%, var(--color-surface));
+  background: transparent;
+  font-size: 11px;
+}
+.repository-review-body .repository-line-sign {
+  display: none;
+}
+.repository-review-body .repository-wrapped-row[data-split="false"] .repository-line-sign {
+  display: block;
+}
+.repository-review-body .repository-wrapped-row code {
+  padding-right: 12px;
+}
+.repository-review-body .repository-code-row[data-kind="added"] .repository-line-number {
+  color: var(--repository-added);
+}
+.repository-review-body .repository-code-row[data-kind="removed"] .repository-line-number {
+  color: var(--repository-removed);
+}
+.repository-review-body .repository-code-row mark {
+  background: color-mix(in srgb, var(--repository-added) 18%, transparent);
+}
+.repository-review-body .repository-code-row[data-kind="removed"] mark {
+  background: color-mix(in srgb, var(--repository-removed) 18%, transparent);
+}
+.repository-review-body .repository-code-row[data-kind="hunk"] {
+  border-radius: 0;
+  box-shadow: none;
+  background: color-mix(in srgb, var(--color-ink) 3%, var(--color-surface));
+}
+.repository-review-body[data-wrap="false"] .repository-wrapped-row code {
+  white-space: pre;
+  overflow-wrap: normal;
+}
+.repository-review-body[data-wrap="false"] .repository-wrapped-row > .repository-code-row {
+  height: 24px;
+  overflow: hidden;
+}
+.workspace-side-panel[data-expanded] .repository-review-body {
+  font-size: 13px;
 }

@@ -5,7 +5,7 @@ import type {
   RepositoryFile,
 } from "../../../../shared/contracts/repository-files";
 import { CodeCell, codeRowKind } from "./code-cell";
-import type { FileRows } from "./file-rows";
+import { unifiedFileRows, type FileRows } from "./file-rows";
 import FileRowsWorker from "./file-rows.worker?worker";
 import { FileIcon, RepositoryIcon } from "./repository-icons";
 import {
@@ -19,7 +19,7 @@ import {
   reviewRowLayout,
 } from "./review-layout";
 import type { RepositoryAPI, RepositoryInvalidation } from "./use-repository-files";
-import "./continuous-review.css";
+import { repositoryRead } from "./repository-read";
 
 type Entry = {
   file: RepositoryFile;
@@ -32,6 +32,7 @@ type Entry = {
 type Layout = {
   change: RepositoryChange;
   entry?: Entry;
+  result?: FileRows;
   rows?: Float64Array;
   height: number;
   bodyOffset?: number;
@@ -39,6 +40,8 @@ type Layout = {
   wrap?: boolean;
 };
 type Anchor = { path: string; row: number | null; within: number; top: number };
+const reviewStatusClassName =
+  "repository-review-status m-0 flex items-center gap-2 text-[12px] text-muted-ink [&>span]:flex-1";
 const unavailableText = {
   filtered: "This file uses external Git filters. Review it in your editor.",
   binary: "Binary or non-UTF-8 file. A text preview is unavailable.",
@@ -62,6 +65,7 @@ export function ContinuousReview({
   comparison,
   refreshing,
   loading,
+  error = "",
   onRefresh,
 }: {
   api: RepositoryAPI;
@@ -75,6 +79,7 @@ export function ContinuousReview({
   comparison: string;
   refreshing: boolean;
   loading: boolean;
+  error?: string;
   onRefresh(): void;
 }) {
   const scroll = useRef<HTMLDivElement>(null);
@@ -86,6 +91,7 @@ export function ContinuousReview({
   const [workerAttempt, setWorkerAttempt] = useState(0);
   const [collapsed, setCollapsed] = useState<ReadonlySet<string>>(new Set());
   const cache = useRef(new Map<string, Entry>());
+  const unified = useRef(new WeakMap<FileRows, FileRows>());
   const errors = useRef(new Map<string, string>());
   const anchor = useRef<Anchor | null>(null);
   const pendingReveal = useRef<string | null>(null);
@@ -97,7 +103,8 @@ export function ContinuousReview({
   } | null>(null);
   const serial = useRef(0);
   const generation = useRef(0);
-  const running = useRef(false);
+  const running = useRef(new Map<symbol, { path: string; generation: number }>());
+  const parsing = useRef<Promise<void>>(Promise.resolve());
   const mounted = useRef(false);
   const wanted = useRef<string[]>([]);
   const attempted = useRef(new Set<string>());
@@ -113,8 +120,13 @@ export function ContinuousReview({
       if (collapsed.has(change.path)) return { change, entry, height: reviewHeaderHeight };
       if (!entry) return { change, height: reviewPlaceholderHeight };
       if (entry.file.kind === "unavailable") return { change, entry, height: 112 };
-      const result = entry.result;
+      let result = entry.result;
       if (!result) return { change, entry, height: reviewPlaceholderHeight };
+      if (viewport.width > 0 && viewport.width < 640 && result.split) {
+        const source = result;
+        result = unified.current.get(source) ?? unifiedFileRows(source);
+        unified.current.set(source, result);
+      }
       const measurementKey = `${key}:${result.split}`;
       if (entry.measurementKey !== measurementKey) {
         entry.measured = new Map();
@@ -134,7 +146,7 @@ export function ContinuousReview({
             : "");
       const bodyOffset = reviewHeaderHeight + (notice ? 24 : 0);
       const height = bodyOffset + Math.max(24, rows[rows.length - 1]) + (effectiveWrap ? 0 : 16);
-      return { change, entry, rows, height, bodyOffset, notice, wrap: effectiveWrap };
+      return { change, entry, result, rows, height, bodyOffset, notice, wrap: effectiveWrap };
     });
     const previews = layouts.filter((item) => item.rows !== undefined);
     const fixedHeight = layouts.reduce(
@@ -157,12 +169,12 @@ export function ContinuousReview({
     });
     const width = layouts.reduce(
       (maximum, item) =>
-        item.wrap === false && item.entry?.result
+        item.wrap === false && item.result
           ? Math.max(
               maximum,
-              Math.max(item.entry.result.beforeWidth, item.entry.result.afterWidth) *
+              Math.max(item.result.beforeWidth, item.result.afterWidth) *
                 8 *
-                (item.entry.result.split ? 2 : 1) +
+                (item.result.split ? 2 : 1) +
                 240,
             )
           : maximum,
@@ -201,19 +213,23 @@ export function ContinuousReview({
   publishRef.current = publish;
   const drain = useRef<() => void>(() => {});
   drain.current = () => {
-    if (running.current || !mounted.current || !current.current.active) return;
+    if (running.current.size >= 4 || !mounted.current || !current.current.active) return;
     const context = current.current;
     const path = wanted.current.find(
       (path) =>
         cache.current.get(path)?.revision !== context.revision.id &&
         !errors.current.has(path) &&
+        ![...running.current.values()].some(
+          (request) => request.path === path && request.generation === generation.current,
+        ) &&
         !attempted.current.has(path),
     );
     if (!path) return;
     wanted.current = wanted.current.filter((candidate) => candidate !== path);
     const change = context.changes.find((change) => change.path === path);
     if (!change) return;
-    running.current = true;
+    const request = Symbol(path);
+    running.current.set(request, { path, generation: generation.current });
     attempted.current.add(path);
     const requestGeneration = generation.current;
     const valid = () =>
@@ -225,21 +241,30 @@ export function ContinuousReview({
       current.current.changes === context.changes;
     void (async () => {
       try {
-        const file = await context.api.repositoryFile(
-          context.projectId,
-          path,
-          change.previousPath ?? undefined,
+        const file = await repositoryRead(
+          context.api.repositoryFile(context.projectId, path, change.previousPath ?? undefined),
         );
         if (!valid()) return;
         let result: FileRows | undefined;
         if (file.kind === "text") {
-          const parser = worker.current;
-          if (!parser) throw new Error("Could not prepare this preview.");
-          result = await new Promise<FileRows>((resolve, reject) => {
-            const id = ++serial.current;
-            workerJob.current = { id, resolve, reject };
-            parser.postMessage({ id, file, path });
+          let finish!: () => void;
+          const previous = parsing.current;
+          parsing.current = new Promise<void>((resolve) => {
+            finish = resolve;
           });
+          try {
+            await previous;
+            if (!valid()) return;
+            const parser = worker.current;
+            if (!parser) throw new Error("Could not prepare this preview.");
+            result = await new Promise<FileRows>((resolve, reject) => {
+              const id = ++serial.current;
+              workerJob.current = { id, resolve, reject };
+              parser.postMessage({ id, file, path });
+            });
+          } finally {
+            finish();
+          }
           if (result.rows[0]?.kind === "hunk" && !result.rows[0].hidden)
             result = { ...result, rows: result.rows.slice(1) };
         }
@@ -285,10 +310,11 @@ export function ContinuousReview({
           publishRef.current();
         }
       } finally {
-        running.current = false;
+        running.current.delete(request);
         drain.current();
       }
     })();
+    drain.current();
   };
   useEffect(() => {
     mounted.current = true;
@@ -551,12 +577,12 @@ export function ContinuousReview({
   }, [geometry, viewport.top, viewport.height, wrap, active]);
   return (
     <>
-      <div className="repository-review-toolbar">
-        <div className="repository-review-identity">
-          <span className="repository-review-count">
+      <div className="repository-review-toolbar flex min-h-9 items-center justify-between gap-2 border-b border-(--repository-hairline) px-2.5 py-0.5 text-[11px] text-muted-ink">
+        <div className="repository-review-identity flex min-w-0 flex-1 items-center gap-3 whitespace-nowrap">
+          <span className="repository-review-count shrink-0 text-[12px] text-ink tabular-nums">
             {changes.length} {changes.length === 1 ? "file" : "files"}
           </span>
-          <span className="repository-review-comparison">{comparison}</span>
+          <span className="repository-review-comparison truncate text-[11px]">{comparison}</span>
         </div>
         <Button
           className="quiet-button repository-icon-button"
@@ -582,18 +608,18 @@ export function ContinuousReview({
       </div>
       <div
         ref={scroll}
-        className="repository-review-scroll"
+        className="repository-review-scroll min-h-0 flex-1 overflow-auto overscroll-contain [overflow-anchor:none] [scrollbar-gutter:stable] focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-(--color-control-border)"
         role="region"
         aria-label="Changed files review"
         tabIndex={0}
       >
         {!changes.length && (
-          <p className="repository-review-status" role="status">
-            {loading ? "Reading changes…" : "No changed files"}
+          <p className={`${reviewStatusClassName} min-h-[72px] px-4 py-3`} role="status">
+            {error ? "Changes unavailable" : loading ? "Reading changes…" : "No changed files"}
           </p>
         )}
         <div
-          className="repository-review-canvas"
+          className="repository-review-canvas relative min-w-0"
           style={{
             height: geometry.offsets[geometry.offsets.length - 1],
             minWidth: geometry.width,
@@ -602,7 +628,7 @@ export function ContinuousReview({
           {geometry.layouts.slice(range.start, range.end).map((item, offset) => {
             const index = range.start + offset;
             const { change, entry } = item;
-            const result = entry?.result;
+            const result = item.result;
             const file = entry?.file;
             const isCollapsed = collapsed.has(change.path);
             const rowRange = item.rows
@@ -612,22 +638,21 @@ export function ContinuousReview({
                   viewport.height,
                 )
               : { start: 0, end: 0 };
-            const sides = result?.split ? (["before", "after"] as const) : (["after"] as const);
             const error = errors.current.get(change.path);
             return (
               <section
-                className="repository-review-section"
+                className="repository-review-section absolute inset-x-0"
                 key={change.path}
                 style={{ top: geometry.offsets[index], height: item.height }}
                 aria-label={change.path}
               >
                 <div
-                  className="repository-review-heading"
+                  className="repository-review-heading sticky top-0 left-0 z-3 flex h-[32px] items-center gap-2 bg-(--color-surface) px-2.5 text-ink [&>svg]:size-[14px] [&>svg]:shrink-0"
                   data-selected={selected === change.path}
                   style={{ width: viewport.width || undefined }}
                 >
                   <Button
-                    className="quiet-button repository-icon-button"
+                    className="grid h-[24px] min-h-[24px] w-5 shrink-0 cursor-pointer place-items-center rounded-[5px] border-0 bg-transparent p-0.5 text-muted-ink hover:bg-(--color-hover-surface) [&_svg]:size-3 aria-expanded:[&_svg]:rotate-90"
                     aria-label={`${isCollapsed ? "Expand" : "Collapse"} ${change.path}`}
                     aria-expanded={!isCollapsed}
                     onClick={() => {
@@ -644,7 +669,7 @@ export function ContinuousReview({
                   </Button>
                   <FileIcon name={change.path} />
                   <Button
-                    className="quiet-button repository-file-path"
+                    className="repository-review-file-path block h-[26px] min-w-0 flex-1 cursor-pointer truncate rounded-[5px] border-0 bg-transparent p-0 text-left text-[12px] font-normal text-muted-ink hover:bg-(--color-hover-surface)"
                     title={
                       change.previousPath ? `${change.previousPath} → ${change.path}` : change.path
                     }
@@ -675,30 +700,37 @@ export function ContinuousReview({
                     </span>
                   )}
                   {change.status !== "modified" && (
-                    <span className="repository-review-file-state" data-status={change.status}>
+                    <span
+                      className="repository-review-file-state shrink-0 text-[10px] text-muted-ink capitalize data-[status=conflict]:text-(--repository-removed) data-[status=deleted]:text-(--repository-removed)"
+                      data-status={change.status}
+                    >
                       {change.status === "typechange" ? "Type changed" : change.status}
                     </span>
                   )}
                 </div>
                 {!isCollapsed &&
                   (file?.kind === "unavailable" ? (
-                    <p className="repository-review-status" role="status">
+                    <p className={`${reviewStatusClassName} min-h-[72px] px-4 py-3`} role="status">
                       {unavailableText[file.reason]}
                     </p>
                   ) : result && item.rows ? (
                     <>
                       {item.notice && (
-                        <p className="repository-review-notice" role="status" title={item.notice}>
+                        <p
+                          className="repository-review-notice m-0 h-[24px] truncate px-3 text-[11px] leading-[24px] text-muted-ink"
+                          role="status"
+                          title={item.notice}
+                        >
                           {item.notice}
                         </p>
                       )}
                       <div
-                        className="repository-review-body"
+                        className="repository-review-body relative overflow-hidden text-[12px] leading-[24px] select-text [font-family:ui-monospace,SFMono-Regular,Menlo,monospace] [tab-size:4]"
                         data-wrap={item.wrap ?? wrap}
                         style={{ height: item.height - (item.bodyOffset ?? reviewBodyOffset) }}
                       >
                         <div
-                          className="repository-review-rows"
+                          className="repository-review-rows relative"
                           style={{
                             height: item.rows[item.rows.length - 1],
                           }}
@@ -715,7 +747,15 @@ export function ContinuousReview({
                                 data-split={result.split}
                                 style={{ top: item.rows?.[rowIndex] }}
                               >
-                                {sides.map((side) => (
+                                {(result.split
+                                  ? (["before", "after"] as const)
+                                  : ([
+                                      (row.kind === "lines" && row.before && !row.after) ||
+                                      (row.kind === "note" && row.side === "before")
+                                        ? "before"
+                                        : "after",
+                                    ] as const)
+                                ).map((side) => (
                                   <div
                                     key={side}
                                     className="repository-code-row"
@@ -730,7 +770,7 @@ export function ContinuousReview({
                             );
                           })}
                           {!result.rows.length && (
-                            <p className="repository-review-status">
+                            <p className={`${reviewStatusClassName} min-h-[24px] px-4 py-0`}>
                               {file?.kind === "text" && file.deleted
                                 ? "Deleted file"
                                 : change.status === "added" || change.status === "untracked"
@@ -742,7 +782,10 @@ export function ContinuousReview({
                       </div>
                     </>
                   ) : (
-                    <div className="repository-review-status" role="status">
+                    <div
+                      className={`${reviewStatusClassName} min-h-[72px] px-4 py-3`}
+                      role="status"
+                    >
                       <span>{error || "Loading preview…"}</span>
                     </div>
                   ))}

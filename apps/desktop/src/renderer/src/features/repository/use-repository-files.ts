@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { repositoryRead } from "./repository-read";
 import type { DesktopAPI } from "../../../../shared/contracts/desktop";
 import type {
   RepositoryChanges,
@@ -40,10 +41,11 @@ export function useRepositoryFiles({
     id: 0,
     paths: null,
   });
+  const directoryQueue = useRef(new Set<string>());
   const directoryRequests = useRef(new Map<string, Promise<void>>());
   const directoryCache = useRef(new Map<string, RepositoryDirectory>());
-  const directoryFailures = useRef(new Set<string>());
-  const fileGeneration = useRef(0);
+  const directoryFailures = useRef(new Map<string, string>());
+  const fileGeneration = useRef(new Map<string, number>());
   const fileCache = useRef(new Map<string, RepositoryFile>());
   const changesRef = useRef(changes);
   changesRef.current = changes;
@@ -57,13 +59,19 @@ export function useRepositoryFiles({
     };
   }, []);
 
-  function rememberDirectoryFailure(path: string) {
+  function rememberDirectoryFailure(path: string, message: string) {
     const failures = directoryFailures.current;
-    failures.add(path);
+    failures.set(path, message);
     if (failures.size > 128) {
-      const first = failures.values().next().value;
+      const first = failures.keys().next().value;
       if (first !== undefined) failures.delete(first);
     }
+    setError(message);
+  }
+
+  function clearDirectoryFailure(path: string) {
+    if (directoryFailures.current.delete(path))
+      setError([...directoryFailures.current.values()].at(-1) ?? "");
   }
 
   const loadDirectory = useCallback(
@@ -73,12 +81,20 @@ export function useRepositoryFiles({
       if (pending) return force ? pending.then(() => loadDirectory(path, true)) : pending;
       if (!force && directoryCache.current.has(path)) return Promise.resolve();
       if (!force && directoryFailures.current.has(path)) return Promise.resolve();
-      if (directoryRequests.current.size >= 4)
-        return force
-          ? Promise.race(directoryRequests.current.values()).then(() => loadDirectory(path, true))
-          : Promise.resolve();
-      const request = api
-        .repositoryDirectory(projectId, path)
+      if (directoryRequests.current.size >= 4) {
+        if (force)
+          return Promise.race(directoryRequests.current.values()).then(() =>
+            loadDirectory(path, true),
+          );
+        directoryQueue.current.add(path);
+        if (directoryQueue.current.size > 128) {
+          const oldest = directoryQueue.current.values().next().value;
+          if (oldest !== undefined) directoryQueue.current.delete(oldest);
+        }
+        return Promise.resolve();
+      }
+      directoryQueue.current.delete(path);
+      const request = repositoryRead(api.repositoryDirectory(projectId, path))
         .then((value) => {
           if (!lifetime.current) return;
           const cache = directoryCache.current;
@@ -93,8 +109,10 @@ export function useRepositoryFiles({
                 entry.path === value.entries[index].path &&
                 entry.kind === value.entries[index].kind,
             )
-          )
+          ) {
+            clearDirectoryFailure(path);
             return;
+          }
           if (previous) {
             const retained = new Set(
               value.entries
@@ -122,23 +140,25 @@ export function useRepositoryFiles({
           if (size > 30000 || cache.size > 128) {
             cache.delete(path);
             if (previous) cache.set(path, previous);
-            rememberDirectoryFailure(path);
-            setError(
+            rememberDirectoryFailure(
+              path,
               "The folder cache is full. Collapse some folders, then refresh to continue browsing.",
             );
             return;
           }
-          directoryFailures.current.delete(path);
+          clearDirectoryFailure(path);
           setDirectories(new Map(cache));
         })
         .catch((cause: unknown) => {
-          rememberDirectoryFailure(path);
           if (lifetime.current)
-            setError(cause instanceof Error ? cause.message : "Could not read this folder.");
+            rememberDirectoryFailure(
+              path,
+              cause instanceof Error ? cause.message : "Could not read this folder.",
+            );
         })
         .finally(() => {
           directoryRequests.current.delete(path);
-          const next = [...latest.current.expanded].find(
+          const next = [...latest.current.expanded, ...directoryQueue.current].find(
             (candidate) =>
               !directoryCache.current.has(candidate) &&
               !directoryRequests.current.has(candidate) &&
@@ -161,14 +181,23 @@ export function useRepositoryFiles({
       ?.entries.some((entry) => entry.path === path && entry.kind === "directory");
   }
   const refreshingRef = useRef(false);
-  const fileRunning = useRef<string | null>(null);
+  const fileRunning = useRef(new Map<symbol, string>());
+  const latestFileRequest = useRef(new Map<string, symbol>());
   const changesInitialized = useRef(false);
-  const pendingRefresh = useRef<{ full: boolean; paths: Set<string> } | null>(null);
+  const lastReconciliation = useRef(Date.now());
+  const pendingRefresh = useRef<{ full: boolean; paths: Set<string>; reconcile: boolean } | null>(
+    null,
+  );
   const refresh = useCallback(
-    async function refresh(paths?: string[]) {
+    async function refresh(paths?: string[], reconcile = false) {
       if (!latest.current.active) return;
       if (refreshingRef.current) {
-        const pending = pendingRefresh.current ?? { full: false, paths: new Set<string>() };
+        const pending = pendingRefresh.current ?? {
+          full: false,
+          paths: new Set<string>(),
+          reconcile,
+        };
+        pending.reconcile &&= reconcile;
         if (!paths) pending.full = true;
         else paths.forEach((path) => pending.paths.add(path));
         pendingRefresh.current = pending;
@@ -176,7 +205,9 @@ export function useRepositoryFiles({
       }
       refreshingRef.current = true;
       const initialized = changesInitialized.current;
-      let invalidateAll = initialized && !paths;
+      const lightweight = reconcile && Date.now() - lastReconciliation.current < 60000;
+      if (!lightweight) lastReconciliation.current = Date.now();
+      let invalidateAll = initialized && !paths && !lightweight;
       const invalidated = new Set(initialized ? paths : []);
       const touches = (path: string) =>
         invalidateAll ||
@@ -185,9 +216,20 @@ export function useRepositoryFiles({
         );
       changesInitialized.current = true;
       setRefreshing(true);
-      setError("");
+      const targets = (paths ?? (lightweight ? [] : ["", ...latest.current.expanded])).filter(
+        knownDirectory,
+      );
+      const refreshDirectories = async () => {
+        for (let index = 0; index < targets.length; index += 4) {
+          if (!lifetime.current || !latest.current.active) break;
+          await Promise.all(
+            targets.slice(index, index + 4).map((path) => loadDirectory(path, true)),
+          );
+        }
+      };
+      const directoriesReady = refreshDirectories();
       try {
-        await api.repositoryChanges(projectId).then(
+        await repositoryRead(api.repositoryChanges(projectId)).then(
           (result) => {
             if (!lifetime.current) return;
             const previous = changesRef.current;
@@ -199,10 +241,27 @@ export function useRepositoryFiles({
               invalidateAll = true;
             const before = new Map(previous?.changes.map((change) => [change.path, change]));
             const after = new Map(result.changes.map((change) => [change.path, change]));
+            if (lightweight) {
+              const parents = new Set<string>();
+              for (const path of new Set([...before.keys(), ...after.keys()])) {
+                const old = before.get(path);
+                const next = after.get(path);
+                if (
+                  old?.status !== next?.status ||
+                  old?.previousPath !== next?.previousPath ||
+                  old?.filtered !== next?.filtered
+                ) {
+                  invalidated.add(path);
+                  parents.add(path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "");
+                }
+              }
+              for (const parent of parents)
+                if (directoryCache.current.has(parent)) void loadDirectory(parent, true);
+            }
             for (const path of new Set([
               ...fileCache.current.keys(),
               ...(latest.current.selected ? [latest.current.selected] : []),
-              ...(fileRunning.current ? [fileRunning.current] : []),
+              ...fileRunning.current.values(),
             ]))
               if (
                 (before.get(path)?.previousPath ?? null) !==
@@ -239,7 +298,9 @@ export function useRepositoryFiles({
           },
         );
         if (!lifetime.current) return;
-        if (fileRunning.current && touches(fileRunning.current)) fileGeneration.current += 1;
+        for (const path of new Set(fileRunning.current.values()))
+          if (touches(path))
+            fileGeneration.current.set(path, (fileGeneration.current.get(path) ?? 0) + 1);
         for (const path of fileCache.current.keys())
           if (touches(path)) fileCache.current.delete(path);
         if (latest.current.selected && touches(latest.current.selected))
@@ -249,13 +310,7 @@ export function useRepositoryFiles({
             id: value.id + 1,
             paths: invalidateAll ? null : [...invalidated],
           }));
-        const targets = (paths ?? ["", ...latest.current.expanded]).filter(knownDirectory);
-        for (let index = 0; index < targets.length; index += 4) {
-          if (!lifetime.current || !latest.current.active) break;
-          await Promise.all(
-            targets.slice(index, index + 4).map((path) => loadDirectory(path, true)),
-          );
-        }
+        await directoriesReady;
       } catch (cause) {
         if (lifetime.current)
           setError(cause instanceof Error ? cause.message : "Could not refresh this repository.");
@@ -265,7 +320,7 @@ export function useRepositoryFiles({
         const pending = pendingRefresh.current;
         pendingRefresh.current = null;
         if (pending && lifetime.current && latest.current.active)
-          void refresh(pending.full ? undefined : [...pending.paths]);
+          void refresh(pending.full ? undefined : [...pending.paths], pending.reconcile);
       }
     },
     [api, projectId, loadDirectory],
@@ -277,6 +332,9 @@ export function useRepositoryFiles({
     void refresh(changesInitialized.current ? undefined : []);
     const focus = () => {
       if (!document.hidden) void refresh();
+    };
+    const reconcile = () => {
+      if (!document.hidden) void refresh(undefined, true);
     };
     const dirty = new Set<string>();
     let notification: ReturnType<typeof setTimeout> | undefined;
@@ -293,7 +351,7 @@ export function useRepositoryFiles({
       }, 100);
     });
     window.addEventListener("focus", focus);
-    const timer = setInterval(focus, 15000);
+    const timer = setInterval(reconcile, 15000);
     return () => {
       unsubscribe();
       clearTimeout(notification);
@@ -311,18 +369,27 @@ export function useRepositoryFiles({
   const wantedFile = useRef<{ path: string } | null>(null);
   const requestFile = useCallback(
     async function run() {
-      if (fileRunning.current) return;
+      if (fileRunning.current.size >= 4) return;
       const wanted = wantedFile.current;
       if (!wanted || !latest.current.active) return;
       wantedFile.current = null;
-      fileRunning.current = wanted.path;
-      const generation = fileGeneration.current;
+      const request = Symbol(wanted.path);
+      fileRunning.current.set(request, wanted.path);
+      latestFileRequest.current.set(wanted.path, request);
+      const generation = fileGeneration.current.get(wanted.path) ?? 0;
       const previousPath =
         changesRef.current?.changes.find((change) => change.path === wanted.path)?.previousPath ??
         undefined;
       try {
-        const content = await api.repositoryFile(projectId, wanted.path, previousPath);
-        if (!lifetime.current || generation !== fileGeneration.current) return;
+        const content = await repositoryRead(
+          api.repositoryFile(projectId, wanted.path, previousPath),
+        );
+        if (
+          !lifetime.current ||
+          generation !== (fileGeneration.current.get(wanted.path) ?? 0) ||
+          latestFileRequest.current.get(wanted.path) !== request
+        )
+          return;
         if (!wantedFile.current) {
           fileCache.current.delete(wanted.path);
           fileCache.current.set(wanted.path, content);
@@ -360,7 +427,8 @@ export function useRepositoryFiles({
       } catch (cause) {
         if (
           lifetime.current &&
-          generation === fileGeneration.current &&
+          generation === (fileGeneration.current.get(wanted.path) ?? 0) &&
+          latestFileRequest.current.get(wanted.path) === request &&
           latest.current.selected === wanted.path &&
           !wantedFile.current
         )
@@ -368,7 +436,11 @@ export function useRepositoryFiles({
             cause instanceof Error && cause.message ? cause.message : "Could not read this file.",
           );
       } finally {
-        fileRunning.current = null;
+        fileRunning.current.delete(request);
+        if (![...fileRunning.current.values()].includes(wanted.path))
+          fileGeneration.current.delete(wanted.path);
+        if (latestFileRequest.current.get(wanted.path) === request)
+          latestFileRequest.current.delete(wanted.path);
         if (lifetime.current && wantedFile.current) void run();
       }
     },
@@ -398,6 +470,9 @@ export function useRepositoryFiles({
     changes,
     file,
     error: changesError || fileError || error,
+    directoryError: error,
+    changesError,
+    fileError,
     refreshing,
     contentRevision,
     refresh,

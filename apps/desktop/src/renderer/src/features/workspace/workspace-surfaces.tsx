@@ -16,7 +16,6 @@ import { RepositoryIcon } from "../repository/repository-icons";
 import type { RepositoryBrowser as RepositoryComponent } from "../repository/repository-browser";
 import type { RepositoryAPI } from "../repository/use-repository-files";
 import type { BrowserWorkspace as BrowserComponent } from "../browser/browser-workspace";
-import "./workspace-surfaces.css";
 
 const RepositoryBrowser = lazyView<ComponentProps<typeof RepositoryComponent>>(
   () =>
@@ -47,7 +46,9 @@ export type BrowserSurface = Omit<
   ComponentProps<typeof BrowserComponent>,
   "open" | "active" | "onClose" | "embedded"
 >;
-const labels = { files: "Files", diff: "Diff", browser: "Browser" } satisfies Record<
+const workspaceIconButtonClassName =
+  "workspace-icon-button grid shrink-0 cursor-pointer place-items-center rounded-[5px] border-0 bg-transparent p-0 text-[12px] text-muted-ink hover:bg-(--color-hover-surface) hover:text-ink active:scale-[0.96]";
+const labels = { files: "Files", diff: "Changes", browser: "Browser" } satisfies Record<
   Surface,
   string
 >;
@@ -77,10 +78,14 @@ export function WorkspaceSurfaces({
   request?: SurfaceRequest;
   onClose(): void;
 }) {
-  const [panel, setPanel] = useSessionState(`repository-surfaces:${projectId}`, panelSchema, {
-    tabs: [],
-    active: null,
-  });
+  const [panel, setPanel] = useSessionState<z.infer<typeof panelSchema>>(
+    `repository-surfaces:${projectId}`,
+    panelSchema,
+    {
+      tabs: repositoryAPI ? ["files"] : browser ? ["browser"] : [],
+      active: repositoryAPI ? "files" : browser ? "browser" : null,
+    },
+  );
   const [width, setWidth] = useSessionState(
     `workspace-panel-width:${projectId}`,
     z.number().int().min(0).max(4096).nullable(),
@@ -118,18 +123,38 @@ export function WorkspaceSurfaces({
     if (selected === "browser") setBrowserMounted(browserKey);
     else if (selected) setRepositoryMounted(true);
   }, [selected, browserKey]);
-  const previousFocus = useRef({ open: false, tab: panel.active });
+  const previousFocus = useRef({ open: false });
+  const [focusRequest, setFocusRequest] = useState(0);
+  const handledFocusRequest = useRef(0);
+  const focusSelectedTab = useCallback(() => {
+    pane.current
+      ?.querySelector<HTMLButtonElement>(
+        selected ? `#workspace-tab-${selected}` : "#workspace-add-surface",
+      )
+      ?.focus();
+  }, [selected]);
   useLayoutEffect(() => {
-    const changed =
-      (open && !previousFocus.current.open) || panel.active !== previousFocus.current.tab;
-    previousFocus.current = { open, tab: panel.active };
-    if (active && changed)
-      pane.current
-        ?.querySelector<HTMLButtonElement>(
-          selected ? `#workspace-tab-${selected}` : "#workspace-add-surface",
-        )
-        ?.focus();
-  }, [active, open, panel.active, selected]);
+    const opening = open && !previousFocus.current.open;
+    if (opening && tabs.length === 0 && !request) {
+      if (hasRepository) openSurface("files");
+      else if (hasBrowser) openSurface("browser");
+    }
+    const changed = opening || focusRequest !== handledFocusRequest.current;
+    previousFocus.current = { open };
+    handledFocusRequest.current = focusRequest;
+    if (active && changed) focusSelectedTab();
+  }, [
+    active,
+    open,
+    panel.active,
+    focusSelectedTab,
+    focusRequest,
+    tabs.length,
+    request,
+    hasRepository,
+    hasBrowser,
+    openSurface,
+  ]);
   useLayoutEffect(() => {
     const node = pane.current,
       parent = node?.parentElement;
@@ -137,9 +162,14 @@ export function WorkspaceSurfaces({
     const update = () => {
       const maximum = Math.max(0, parent.clientWidth - Math.min(280, parent.clientWidth * 0.45));
       if (width === null) parent.style.removeProperty("--workspace-panel-width");
-      else parent.style.setProperty("--workspace-panel-width", `${Math.min(width, maximum)}px`);
+      else
+        parent.style.setProperty(
+          "--workspace-panel-width",
+          `${Math.max(Math.min(320, maximum), Math.min(width, maximum))}px`,
+        );
       separator.current?.setAttribute("aria-valuenow", String(Math.round(node.clientWidth)));
       separator.current?.setAttribute("aria-valuemax", String(Math.round(maximum)));
+      separator.current?.setAttribute("aria-valuemin", String(Math.round(Math.min(320, maximum))));
     };
     const observer = new ResizeObserver(update);
     observer.observe(parent);
@@ -148,7 +178,7 @@ export function WorkspaceSurfaces({
       observer.disconnect();
       parent.style.removeProperty("--workspace-panel-width");
     };
-  }, [width]);
+  }, [width, open, expanded]);
   const resize = (requested: number) => {
     const parent = pane.current?.parentElement;
     if (!parent) return 0;
@@ -162,7 +192,7 @@ export function WorkspaceSurfaces({
     <aside
       ref={pane}
       id="workspace-side-panel"
-      className="workspace-side-panel"
+      className="workspace-side-panel relative flex min-h-0 min-w-0 flex-col overflow-clip border-l border-border bg-(--color-surface) text-[13px] leading-[1.5] text-ink [--workspace-hairline:color-mix(in_srgb,var(--color-border)_65%,transparent)]"
       hidden={!open}
       aria-label="Workspace surfaces"
       data-expanded={expanded || undefined}
@@ -175,7 +205,7 @@ export function WorkspaceSurfaces({
     >
       <div
         ref={separator}
-        className="workspace-resize-handle"
+        className="workspace-resize-handle absolute inset-y-0 left-0 z-3 w-[5px] cursor-col-resize touch-none hover:bg-border focus-visible:-outline-offset-1 focus-visible:outline focus-visible:outline-(--color-control-border) in-data-[expanded]:hidden"
         role="separator"
         aria-label="Resize side panel"
         aria-orientation="vertical"
@@ -216,18 +246,28 @@ export function WorkspaceSurfaces({
           setWidth(Math.round(pane.current?.clientWidth ?? 0));
         }}
       />
-      <header className="workspace-surface-header">
-        <div role="tablist" aria-label="Workspace surfaces" className="workspace-surface-tabs">
+      <header className="workspace-surface-header flex h-[42px] min-h-[42px] shrink-0 items-center gap-1 border-b border-(--workspace-hairline) bg-panel px-2.5 py-1">
+        <div
+          role="tablist"
+          aria-label="Workspace surfaces"
+          className="workspace-surface-tabs flex min-w-0 flex-1 items-center gap-1 overflow-x-auto p-0.5"
+        >
           {tabs.map((surface, index) => (
-            <div className="workspace-surface-tab" key={surface}>
+            <div
+              className={`workspace-surface-tab flex shrink-0 items-center rounded-md border ${selected === surface ? "border-(--workspace-hairline) bg-(--color-surface) shadow-[0_1px_2px_#00000004]" : "border-transparent"}`}
+              key={surface}
+            >
               <Button
                 id={`workspace-tab-${surface}`}
-                className="quiet-button"
+                className="flex cursor-pointer items-center gap-1.5 rounded-[5px] border-0 bg-transparent px-2 py-1 text-[12px] text-muted-ink hover:bg-(--color-hover-surface) aria-selected:font-medium aria-selected:text-ink"
                 role="tab"
                 aria-selected={selected === surface}
                 aria-controls={`workspace-surface-${surface}`}
                 tabIndex={selected === surface || (selected === null && index === 0) ? 0 : -1}
-                onClick={() => openSurface(surface)}
+                onClick={() => {
+                  setFocusRequest((value) => value + 1);
+                  openSurface(surface);
+                }}
                 onPointerEnter={() => {
                   void (surface === "browser" ? BrowserWorkspace : RepositoryBrowser)
                     .preload()
@@ -236,6 +276,7 @@ export function WorkspaceSurfaces({
                 onKeyDown={(event) => {
                   if (event.key === "Delete") {
                     event.preventDefault();
+                    setFocusRequest((value) => value + 1);
                     const remaining = panel.tabs.filter((tab) => tab !== surface);
                     setPanel({
                       tabs: remaining,
@@ -253,6 +294,7 @@ export function WorkspaceSurfaces({
                           ? tabs.length - 1
                           : (index + (event.key === "ArrowLeft" ? tabs.length - 1 : 1)) %
                             tabs.length;
+                    setFocusRequest((value) => value + 1);
                     openSurface(tabs[next]);
                   }
                 }}
@@ -261,9 +303,10 @@ export function WorkspaceSurfaces({
                 {labels[surface]}
               </Button>
               <Button
-                className="quiet-button workspace-icon-button"
+                className={`${workspaceIconButtonClassName} mr-0.5 h-[26px] min-h-[26px] w-6 [&_svg]:size-3`}
                 aria-label={`Close ${labels[surface]} surface`}
                 onClick={() => {
+                  setFocusRequest((value) => value + 1);
                   const remaining = panel.tabs.filter((tab) => tab !== surface);
                   setPanel({
                     tabs: remaining,
@@ -281,15 +324,18 @@ export function WorkspaceSurfaces({
         </div>
         <Button
           id="workspace-add-surface"
-          className="quiet-button workspace-icon-button"
+          className={`${workspaceIconButtonClassName} size-7 min-h-7`}
           aria-label="Open a tab"
           title="Open a tab"
-          onClick={() => setPanel((current) => ({ ...current, active: null }))}
+          onClick={() => {
+            setFocusRequest((value) => value + 1);
+            setPanel((current) => ({ ...current, active: null }));
+          }}
         >
           <RepositoryIcon name="plus" />
         </Button>
         <Button
-          className="quiet-button workspace-icon-button"
+          className={`${workspaceIconButtonClassName} size-7 min-h-7`}
           aria-label={expanded ? "Restore side panel size" : "Expand side panel"}
           title={expanded ? "Restore side panel size" : "Expand side panel"}
           onClick={() => setExpanded((value) => !value)}
@@ -297,7 +343,7 @@ export function WorkspaceSurfaces({
           <Glyph name="expand" />
         </Button>
         <Button
-          className="quiet-button workspace-icon-button"
+          className={`${workspaceIconButtonClassName} size-7 min-h-7`}
           aria-label="Close side panel"
           title="Close side panel"
           onClick={onClose}
@@ -306,14 +352,19 @@ export function WorkspaceSurfaces({
         </Button>
       </header>
       {selected === null && (
-        <div className="workspace-surface-launcher" aria-label="Open a tab">
-          <div>
-            <p>Open a tab</p>
+        <div
+          className="workspace-surface-launcher grid min-h-0 flex-1 grid-rows-[minmax(0,2fr)_auto_minmax(0,3fr)] place-items-center overflow-y-auto px-5 py-6"
+          aria-label="Open a tab"
+        >
+          <div className="row-start-2 grid w-full max-w-56 gap-1">
             {(["files", "diff", "browser"] as const).filter(available).map((surface) => (
               <Button
                 key={surface}
-                className="quiet-button"
-                onClick={() => openSurface(surface)}
+                className="flex min-h-11 w-full cursor-pointer items-center gap-3 rounded-lg border-0 bg-transparent px-3 py-2.5 text-left text-[13px] text-(--color-secondary-ink) hover:text-ink focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-(--color-control-border) [&>svg]:size-[18px] [&>svg]:shrink-0 [&>svg]:text-muted-ink"
+                onClick={() => {
+                  setFocusRequest((value) => value + 1);
+                  openSurface(surface);
+                }}
                 onPointerEnter={() => {
                   void (surface === "browser" ? BrowserWorkspace : RepositoryBrowser)
                     .preload()
@@ -329,7 +380,7 @@ export function WorkspaceSurfaces({
       )}
       {repositoryAPI && (repositoryMounted || selected === "files" || selected === "diff") && (
         <div
-          className="workspace-surface-content"
+          className="workspace-surface-content flex min-h-0 min-w-0 flex-1 overflow-hidden"
           hidden={selected !== "files" && selected !== "diff"}
         >
           <RepositoryBrowser
@@ -337,14 +388,13 @@ export function WorkspaceSurfaces({
             projectId={projectId}
             active={active && (selected === "files" || selected === "diff")}
             surface={selected === "diff" ? "diff" : "files"}
-            onOpenSurface={openSurface}
           />
         </div>
       )}
       {browser && (browserMounted === browserKey || selected === "browser") && (
         <div
           id="workspace-surface-browser"
-          className="workspace-surface-content"
+          className="workspace-surface-content flex min-h-0 min-w-0 flex-1 overflow-hidden"
           role="tabpanel"
           aria-labelledby="workspace-tab-browser"
           hidden={selected !== "browser"}
