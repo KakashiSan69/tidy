@@ -17,6 +17,7 @@ import type { AttachedFile } from "../../../../shared/contracts/attachments";
 import type { HarnessSettings } from "../../../../shared/contracts/harness-settings";
 import type { WorkspaceMachine } from "../../../../shared/remote";
 export type Draft = {
+  threadMode?: import("../../../../shared/contracts/thread-workspace").ThreadMode;
   text: string;
   harness: HarnessId;
   designIds: string[];
@@ -121,6 +122,7 @@ export async function copyDraft({
       designIds: imported?.designIds ?? [],
       cloudFileIds: undefined,
       executionProjectId: undefined,
+      threadMode: undefined,
       skill: undefined,
     },
   };
