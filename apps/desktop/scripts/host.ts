@@ -57,6 +57,7 @@ try {
       let runtime = await ready();
       if (
         runtime &&
+        !process.argv.includes("--reconnect") &&
         shouldUpdateHost({
           current: runtime,
           candidate: { buildId, sourceTimestamp },
@@ -237,7 +238,9 @@ try {
   } else if (command === "revoke") {
     await sessions.revoke(z.string().uuid().parse(process.argv[3]));
   } else if (command === "version") {
-    process.stdout.write(JSON.stringify({ protocol: 3, buildId, sourceTimestamp }) + "\n");
+    process.stdout.write(
+      JSON.stringify({ protocol: 3, buildId, sourceTimestamp, capabilities: ["reconnect"] }) + "\n",
+    );
   } else throw new Error("Usage: tidy-host serve | ensure CLIENT_ID | revoke CLIENT_ID | version");
 } catch (error) {
   process.stderr.write(
