@@ -48,10 +48,12 @@ export class RemoteClient {
   private socket?: WebSocket;
   private supportsThreadNaming = false;
   private supportsRepositoryFiles = false;
+  private supportsRepositoryLinks = false;
   private supportsRepositorySearch = false;
   private capabilities: string[] = [];
   private supportsMobilePreview = false;
   private connection?: RemoteConnection;
+  private repositoryReads = new Set<string>();
   private pending = new Map<
     string,
     {
@@ -484,7 +486,7 @@ export class RemoteClient {
         ),
       );
     if (this.closed || this.socket?.readyState !== WebSocket.OPEN)
-      return Promise.reject(new Error("Remote machine is disconnected. Wait for reconnection."));
+      return Promise.reject(new Error("This machine is offline. Try again when it reconnects."));
     if (name.startsWith("mobile-") && !this.supportsMobilePreview)
       return Promise.reject(
         new Error(
@@ -493,16 +495,17 @@ export class RemoteClient {
       );
     if (
       (name === "repository-search" && !this.supportsRepositorySearch) ||
+      (name === "repository-link" && !this.supportsRepositoryLinks) ||
       (!this.supportsRepositoryFiles &&
         ["repository-directory", "repository-changes", "repository-file"].includes(name))
     )
       return Promise.reject(
-        new Error(
-          "Repository files need a backend update. Choose Update backend in Settings → Remote machines.",
-        ),
+        new Error("Update this machine in Settings > Remote machines to open files."),
       );
     if (
-      [...this.pending.values()].filter((item) => !item.recovering).length >= 64 ||
+      [...this.pending.values()].filter((item) => !item.recovering).length +
+        [...this.repositoryReads].filter((id) => !this.pending.has(id)).length >=
+        64 ||
       this.pending.size >= 128
     )
       return Promise.reject(new Error("Too many pending requests."));
@@ -547,22 +550,40 @@ export class RemoteClient {
         ),
       );
     const socket = this.socket;
+    const repositoryRead = [
+      "repository-directory",
+      "repository-search",
+      "repository-link",
+      "repository-changes",
+      "repository-file",
+    ].includes(name);
+    if (repositoryRead && this.repositoryReads.size >= 8)
+      return Promise.reject(new Error("This machine is busy opening files. Try again shortly."));
     const id = randomUUID();
     const frame = JSON.stringify({ id, name, input, ...context });
     if (Buffer.byteLength(frame) > MAX_REMOTE_BYTES || socket.bufferedAmount > MAX_REMOTE_BYTES)
       return Promise.reject(new Error("The remote request is too large."));
     return new Promise<unknown>((resolve, reject) => {
+      if (repositoryRead) this.repositoryReads.add(id);
       const timer = setTimeout(
         () => {
           this.pending.delete(id);
           reject(
             new Error(
-              "Request timed out. It may have completed; check refreshed state before retrying.",
+              repositoryRead
+                ? "This file took too long to open. Try again."
+                : "Request timed out. It may have completed; check refreshed state before retrying.",
             ),
           );
-          socket.terminate();
+          if (!repositoryRead) socket.terminate();
         },
-        name === "setup-project" ? 330_000 : isRemoteMutation(name) ? 120_000 : 60_000,
+        repositoryRead
+          ? 15_000
+          : name === "setup-project"
+            ? 330_000
+            : isRemoteMutation(name)
+              ? 120_000
+              : 60_000,
       );
       this.pending.set(id, {
         resolve,
@@ -755,6 +776,7 @@ export class RemoteClient {
             throw new Error("Unexpected remote identity.");
           this.supportsThreadNaming = frame.capabilities?.includes("thread-naming") ?? false;
           this.supportsMobilePreview = frame.capabilities?.includes("mobile-preview-v1") ?? false;
+          this.supportsRepositoryLinks = frame.capabilities?.includes("repository-links") ?? false;
           this.supportsRepositoryFiles = frame.capabilities?.includes("repository-files") ?? false;
           this.supportsRepositorySearch =
             frame.capabilities?.includes("repository-search") ?? false;
@@ -809,6 +831,7 @@ export class RemoteClient {
         } else if (!greeted) throw new Error("Missing handshake.");
         else if (frame.type === "event") this.recovery.receive(frame.event);
         else {
+          this.repositoryReads.delete(frame.id);
           const item = this.pending.get(frame.id);
           if (item) {
             clearTimeout(item.timer);
@@ -831,6 +854,7 @@ export class RemoteClient {
     if (this.controller !== controller) return;
     this.controller = undefined;
     this.supportsThreadNaming = false;
+    this.supportsRepositoryLinks = false;
     this.supportsRepositoryFiles = false;
     this.supportsRepositorySearch = false;
     this.capabilities = [];
@@ -847,6 +871,7 @@ export class RemoteClient {
     controller.abort();
     this.socket?.terminate();
     this.socket = undefined;
+    this.repositoryReads.clear();
     this.connection?.close();
     this.connection = undefined;
     clearInterval(this.heartbeat);

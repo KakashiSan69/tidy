@@ -1,3 +1,5 @@
+import { createFilePrefetch, FilePrefetchContext } from "../features/repository/file-prefetch";
+import { FileNavigationContext } from "../features/repository/file-navigation";
 import { useThreadCompletion } from "../features/threads/use-thread-completion";
 import {
   currentDefaultAccess,
@@ -481,6 +483,9 @@ export function App({
     const ownerId = repositoryOwnerId;
     const threadId = repositoryThreadId;
     return {
+      resolveRepositoryLink: api.resolveRepositoryLink
+        ? (id: string, href: string) => api.resolveRepositoryLink!(ownerId ?? id, href, threadId)
+        : undefined,
       repositoryDirectory: (id: string, path: string) =>
         api.repositoryDirectory!(ownerId ?? id, path, threadId),
       repositorySearch: api.repositorySearch
@@ -492,6 +497,31 @@ export function App({
       onEvent: api.onEvent,
     };
   }, [api, repositoryOwnerId, repositoryThreadId]);
+  const prefetchEnabled = useRef(false);
+  prefetchEnabled.current = mode === "code" && !settingsOpen && (!machine || machine.connected);
+  const filePrefetch = useMemo(
+    () =>
+      repositoryAPI && surfaceProject
+        ? createFilePrefetch({
+            api: repositoryAPI,
+            projectId: surfaceProject.id,
+            enabled: () => prefetchEnabled.current,
+            prepare: async () => {
+              await WorkspaceSurfaces.preload();
+              const view = await import("../features/workspace/workspace-surfaces");
+              await view.preloadFileViewer();
+            },
+          })
+        : null,
+    [
+      repositoryAPI,
+      surfaceProject?.id,
+      selectedWorktree?.path,
+      selectedThreadId,
+      machine?.current.id,
+    ],
+  );
+  useEffect(() => () => filePrefetch?.dispose(), [filePrefetch]);
   const mobileAPI = useMemo(() => {
     const mobile = api?.mobile;
     if (!mobile) return undefined;
@@ -528,6 +558,24 @@ export function App({
         : request,
     );
   }, [browserScope?.projectId, browserScope?.threadId]);
+  const openFileLink = useCallback(
+    (href: string) => {
+      if (!browserScope || !repositoryAPI) {
+        showToast("Choose a code project to preview this file.");
+        return;
+      }
+      const id = crypto.randomUUID();
+      setRepositoryMounted(true);
+      setRepositoryOpen(true);
+      setSurfaceRequest({
+        id,
+        surface: "files",
+        file: { id, href },
+        scope: `${browserScope.projectId}:${browserScope.threadId}`,
+      });
+    },
+    [browserScope, repositoryAPI],
+  );
   const openBrowserLink = useCallback(
     (url: string) => {
       if (!browserScope) return;
@@ -2566,21 +2614,25 @@ export function App({
                         </Button>
                       )}
                   </div>
-                  <BrowserNavigationContext value={openBrowserLink}>
-                    <Conversations
-                      key={failureNoticeAccessKey}
-                      projectId={project.id}
-                      selected={selectedThreadId ?? null}
-                      threads={threads}
-                      machineId={machine?.current.id ?? "local"}
-                      active={!settingsOpen && mode === "code"}
-                      api={api!}
-                      summaries={snapshot?.threads}
-                      onOpenThread={selectThread}
-                      connected={machine ? machine.connected : true}
-                      orchestrationSupported={orchestrationSupported}
-                    />
-                  </BrowserNavigationContext>
+                  <FilePrefetchContext value={filePrefetch}>
+                    <FileNavigationContext value={openFileLink}>
+                      <BrowserNavigationContext value={openBrowserLink}>
+                        <Conversations
+                          key={failureNoticeAccessKey}
+                          projectId={project.id}
+                          selected={selectedThreadId ?? null}
+                          threads={threads}
+                          machineId={machine?.current.id ?? "local"}
+                          active={!settingsOpen && mode === "code"}
+                          api={api!}
+                          summaries={snapshot?.threads}
+                          onOpenThread={selectThread}
+                          connected={machine ? machine.connected : true}
+                          orchestrationSupported={orchestrationSupported}
+                        />
+                      </BrowserNavigationContext>
+                    </FileNavigationContext>
+                  </FilePrefetchContext>
                   {thread?.pendingApprovals?.length && api ? (
                     <ApprovalRequests
                       key={thread.id}
@@ -3085,53 +3137,56 @@ export function App({
                 {surfaceProject &&
                   (repositoryAPI || api?.browser || api?.mobile) &&
                   repositoryMounted && (
-                    <WorkspaceSurfaces
-                      key={`${surfaceProject.id}:${selectedWorktree?.path ?? "local"}`}
-                      projectId={surfaceProject.id}
-                      repositoryAPI={repositoryAPI ?? undefined}
-                      mobile={
-                        mobileAPI
-                          ? {
-                              api: mobileAPI,
-                              connected: !machine || machine.connected,
-                              onOpenLink: (url) => {
-                                void api
-                                  ?.openChatLink(surfaceProject.id, url)
-                                  .catch((error: unknown) =>
-                                    showToast(
-                                      error instanceof Error
-                                        ? error.message
-                                        : "Could not open setup instructions.",
-                                    ),
-                                  );
-                              },
-                            }
-                          : undefined
-                      }
-                      open={repositoryOpen}
-                      active={!settingsOpen && mode === "code" && repositoryOpen}
-                      request={
-                        surfaceRequest?.scope ===
-                        `${browserScope?.projectId}:${browserScope?.threadId}`
-                          ? surfaceRequest
-                          : undefined
-                      }
-                      browser={
-                        api?.browser && browserScope
-                          ? {
-                              api: api.browser,
-                              scope: browserScope,
-                              requestedURL: browserRequest,
-                              connected: !machine || machine.connected,
-                              machineLabel: machine?.current.label ?? "This machine",
-                            }
-                          : undefined
-                      }
-                      onClose={() => {
-                        setRepositoryOpen(false);
-                        setBrowserRequest(undefined);
-                      }}
-                    />
+                    <FilePrefetchContext value={filePrefetch}>
+                      <WorkspaceSurfaces
+                        key={`${surfaceProject.id}:${selectedWorktree?.path ?? "local"}`}
+                        projectId={surfaceProject.id}
+                        repositoryAPI={repositoryAPI ?? undefined}
+                        connected={!machine || machine.connected}
+                        mobile={
+                          mobileAPI
+                            ? {
+                                api: mobileAPI,
+                                connected: !machine || machine.connected,
+                                onOpenLink: (url) => {
+                                  void api
+                                    ?.openChatLink(surfaceProject.id, url)
+                                    .catch((error: unknown) =>
+                                      showToast(
+                                        error instanceof Error
+                                          ? error.message
+                                          : "Could not open setup instructions.",
+                                      ),
+                                    );
+                                },
+                              }
+                            : undefined
+                        }
+                        open={repositoryOpen}
+                        active={!settingsOpen && mode === "code" && repositoryOpen}
+                        request={
+                          surfaceRequest?.scope ===
+                          `${browserScope?.projectId}:${browserScope?.threadId}`
+                            ? surfaceRequest
+                            : undefined
+                        }
+                        browser={
+                          api?.browser && browserScope
+                            ? {
+                                api: api.browser,
+                                scope: browserScope,
+                                requestedURL: browserRequest,
+                                connected: !machine || machine.connected,
+                                machineLabel: machine?.current.label ?? "This machine",
+                              }
+                            : undefined
+                        }
+                        onClose={() => {
+                          setRepositoryOpen(false);
+                          setBrowserRequest(undefined);
+                        }}
+                      />
+                    </FilePrefetchContext>
                   )}
               </section>
             </>

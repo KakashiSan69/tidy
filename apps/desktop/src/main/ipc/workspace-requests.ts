@@ -1,3 +1,5 @@
+import { repositoryReadError } from "../repository/repository-errors";
+import { resolveRepositoryReference } from "../repository/repository-link";
 import { threadModeSchema } from "../../shared/contracts/thread-workspace";
 import { searchRepositoryFiles } from "../repository/repository-search";
 import {
@@ -89,9 +91,23 @@ export function createWorkspaceRequests<Context>(
             ? value
             : undefined;
       if (typeof target === "string") await service.assertProjectAccess(target);
-      const result = await action(value, context);
-      if (typeof target === "string") await service.assertProjectAccess(target);
-      return result;
+      try {
+        const result = await action(value, context);
+        if (typeof target === "string") await service.assertProjectAccess(target);
+        return result;
+      } catch (error) {
+        if (
+          [
+            "repository-directory",
+            "repository-search",
+            "repository-changes",
+            "repository-link",
+            "repository-file",
+          ].includes(name)
+        )
+          throw repositoryReadError(error);
+        throw error;
+      }
     });
   }
   handle(
@@ -335,6 +351,15 @@ export function createWorkspaceRequests<Context>(
   );
   handle("repository-changes", z.object(repositoryScope).strict(), async (value) =>
     readRepositoryChanges(await service.repositoryPath(value.projectId, value.threadId)),
+  );
+  handle(
+    "repository-link",
+    z.object({ ...repositoryScope, href: z.string().min(1).max(4096) }).strict(),
+    async (value) =>
+      resolveRepositoryReference(
+        await service.repositoryPath(value.projectId, value.threadId),
+        value.href,
+      ),
   );
   handle(
     "repository-file",

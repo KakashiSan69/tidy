@@ -1,18 +1,34 @@
 import type { CodeLine, CodeRow } from "./file-rows";
 
-function LineText({ line }: { line: CodeLine }) {
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+export function fileColumnRange(line: CodeLine, column: number): [number, number] | null {
+  const offset = column - 1;
+  const visibleLength =
+    line.sourceLength && line.sourceLength > 4000
+      ? line.text.length - " … [line clipped]".length
+      : line.text.length;
+  if (!Number.isSafeInteger(column) || offset < 0 || offset >= visibleLength) return null;
+  for (const part of graphemes.segment(line.text.slice(0, visibleLength))) {
+    const end = part.index + part.segment.length;
+    if (offset < end) return [part.index, end];
+  }
+  return null;
+}
+
+function LineText({ line, column }: { line: CodeLine; column?: number }) {
+  const emphasis = column ? fileColumnRange(line, column) : line.emphasis;
   let offset = 0;
   return (line.tokens ?? [{ text: line.text || " ", classes: "" }]).map((token, index) => {
     const start = offset;
     offset += token.text.length;
-    const from = line.emphasis ? Math.max(start, line.emphasis[0]) - start : 0;
-    const to = line.emphasis ? Math.min(offset, line.emphasis[1]) - start : 0;
+    const from = emphasis ? Math.max(start, emphasis[0]) - start : 0;
+    const to = emphasis ? Math.min(offset, emphasis[1]) - start : 0;
     return (
       <span className={token.classes || undefined} key={index}>
         {to > from ? (
           <>
             {token.text.slice(0, from)}
-            <mark>{token.text.slice(from, to)}</mark>
+            <mark data-file-column={column ? true : undefined}>{token.text.slice(from, to)}</mark>
             {token.text.slice(to)}
           </>
         ) : (
@@ -33,7 +49,15 @@ export function codeRowKind(row: CodeRow, side: "before" | "after") {
           : "added"
         : "context";
 }
-export function CodeCell({ row, side }: { row: CodeRow; side: "before" | "after" }) {
+export function CodeCell({
+  row,
+  side,
+  column,
+}: {
+  row: CodeRow;
+  side: "before" | "after";
+  column?: number;
+}) {
   if (row.kind === "hunk")
     return (
       <>
@@ -66,7 +90,7 @@ export function CodeCell({ row, side }: { row: CodeRow; side: "before" | "after"
       <span className="repository-line-sign" aria-hidden="true">
         {line && row.changed ? (side === "before" ? "−" : "+") : ""}
       </span>
-      <code>{line ? <LineText line={line} /> : " "}</code>
+      <code>{line ? <LineText line={line} column={column} /> : " "}</code>
     </>
   );
 }

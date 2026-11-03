@@ -31,7 +31,7 @@ test("web, service, email and PR destinations select the appropriate icon", () =
 test("file references preserve custom rich labels and show complete line and column positions", () => {
   const output = render("src/Button.tsx:24:5", "Button.tsx:24:5");
   expect(output).toContain('data-icon="react"');
-  expect(output).toContain('title="Show in folder: src/Button.tsx:24:5"');
+  expect(output).toContain('title="Open file: src/Button.tsx:24:5"');
   expect(output).toContain("· L24:C5");
   expect(output).not.toContain("<span>Button.tsx:24:5</span>");
   expect(render("src/Button.tsx:24:5", "Button.tsx:24")).not.toContain(
@@ -52,6 +52,12 @@ test("media and unknown files use file chips", () => {
     expect(output).toContain('class="chat-file-link"');
     expect(output).toContain(`data-icon="${icon}"`);
   }
+});
+
+test("file ranges display both their start and end lines", () => {
+  const output = render("src/Button.tsx#L20-L35");
+  expect(output).toContain("· L20-L35");
+  expect(output).toContain('title="Open file: src/Button.tsx:20-35"');
 });
 
 test("unsupported links cannot render a clickable destination", () => {
