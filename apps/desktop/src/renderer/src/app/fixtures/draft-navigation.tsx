@@ -25,8 +25,21 @@ export async function runDraftNavigationTests(
   run: (name: string, test: (root: Root) => Promise<void>) => Promise<void>,
   { host, nativeAPI }: { host: HTMLElement; nativeAPI: DesktopAPI },
 ) {
-  for (const destination of ["stay", "thread", "settings", "new", "reply"] as const) {
-    await run(`failed draft submission recovers after ${destination} navigation`, async (root) => {
+  for (const destination of [
+    "stay",
+    "thread",
+    "settings",
+    "new",
+    "reply",
+    "started",
+    "status-retry",
+    "existing-send",
+  ] as const) {
+    const name =
+      destination === "started" || destination === "status-retry" || destination === "existing-send"
+        ? `new thread status waits for startup: ${destination}`
+        : `failed draft submission recovers after ${destination} navigation`;
+    await run(name, async (root) => {
       const { App } = await import("../app");
       const timestamp = "2026-10-20T12:00:00.000Z";
       const project = {
@@ -55,8 +68,19 @@ export async function runDraftNavigationTests(
       const harnesses: Bootstrap["harnesses"] = [{ id: "codex", name: "Codex", status: "ready" }];
       const bootstrap: Bootstrap = { projects: [project], activeProject: snapshot, harnesses };
       let rejectStart: (reason: Error) => void = () => {};
+      let resolveStart: (thread: Thread) => void = () => {};
+      let resolveSend: (thread: Thread) => void = () => {};
+      let sent = false;
+      const pendingSend = new Promise<Thread>((resolve) => {
+        resolveSend = resolve;
+      });
+      let starting: Thread | undefined;
+      let persisted = false;
+      let statusUnavailable = true;
+      const statusReads: string[] = [];
       let submitted = false;
-      const pendingStart = new Promise<Thread>((_, reject) => {
+      const pendingStart = new Promise<Thread>((resolve, reject) => {
+        resolveStart = resolve;
         rejectStart = reject;
       });
       const api: DesktopAPI = {
@@ -91,9 +115,28 @@ export async function runDraftNavigationTests(
         warmThread: async () => {},
         threadPorts: async () => [],
         readThread: async () => previous,
-        startThread() {
+        readThreadTasks: async ({ threadId }) => {
+          statusReads.push(threadId);
+          if (threadId === starting?.id) {
+            check(persisted, "Status read raced thread creation");
+            if (statusUnavailable) throw new Error("Fixture status unavailable");
+          }
+          return { parent: null, tasks: [], nextCursor: null };
+        },
+        startThread(input) {
           submitted = true;
+          starting = {
+            ...previous,
+            id: required(input.threadId, "New thread ID"),
+            title: "Recover this prompt",
+            status: destination === "existing-send" ? "completed" : "running",
+            messages: [{ id: crypto.randomUUID(), role: "user", text: input.prompt }],
+          };
           return pendingStart;
+        },
+        sendMessage() {
+          sent = true;
+          return pendingSend;
         },
       };
       const machine = { id: "local" as const, label: "Fixture", status: null };
@@ -144,7 +187,72 @@ export async function runDraftNavigationTests(
       await until(() => !submit().disabled, "Submission ready");
       flushSync(() => submit().click());
       await until(() => submitted, "Deferred submission");
+      await until(() => Boolean(host.querySelector(".transcript")), "Optimistic conversation");
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      window.dispatchEvent(new Event("focus"));
+      window.dispatchEvent(new Event("online"));
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      check(
+        !statusReads.includes(required(starting, "Starting thread").id),
+        "Task status was requested before startup settled",
+      );
+      check(!host.querySelector(".agent-task-recovery"), "Startup showed a status error");
       check(!draftButton(), "Submitting left a draft row");
+      if (
+        destination === "started" ||
+        destination === "status-retry" ||
+        destination === "existing-send"
+      ) {
+        persisted = true;
+        statusUnavailable = destination === "status-retry";
+        resolveStart(required(starting, "Starting thread"));
+        await until(() => statusReads.includes(starting!.id), "Automatic status after startup");
+        if (destination === "existing-send") {
+          const initialReads = statusReads.length;
+          try {
+            flushSync(() => {
+              editor().textContent = "Continue the existing thread";
+              editor().dispatchEvent(new InputEvent("input", { bubbles: true }));
+            });
+            await until(() => !submit().disabled, "Existing thread submission ready");
+            flushSync(() => submit().click());
+            await until(() => sent, "Existing thread send pending");
+            window.dispatchEvent(new Event("focus"));
+            await until(
+              () => statusReads.length > initialReads,
+              "Existing thread status refreshes before send completes",
+            );
+            check(!host.querySelector(".agent-task-recovery"), "Existing send showed an error");
+          } finally {
+            resolveSend({ ...required(starting, "Existing thread"), revision: 3 });
+          }
+          return;
+        }
+        if (destination === "started") {
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+          check(!host.querySelector(".agent-task-recovery"), "Successful startup showed an error");
+          check(
+            statusReads.filter((id) => id === starting?.id).length === 1,
+            "Successful startup issued duplicate status requests",
+          );
+          return;
+        }
+        await until(
+          () => Boolean(host.querySelector(".agent-task-recovery")),
+          "Genuine status failure remains recoverable",
+        );
+        statusUnavailable = false;
+        required(
+          host.querySelector<HTMLButtonElement>(".agent-task-recovery button"),
+          "Status retry",
+        ).click();
+        await until(() => !host.querySelector(".agent-task-recovery"), "Status retry clears error");
+        check(
+          statusReads.filter((id) => id === starting?.id).length === 2,
+          "Startup or retry issued duplicate status requests",
+        );
+        return;
+      }
       if (destination === "reply") {
         flushSync(() => {
           editor().textContent = "Include the latest details";
@@ -187,6 +295,11 @@ export async function runDraftNavigationTests(
         () => drafts.get("local")?.[`${project.id}:new`]?.text === expected,
         "Recovered unsent text",
       );
+      check(
+        !statusReads.includes(required(starting, "Starting thread").id),
+        "Failed or abandoned startup issued a status request",
+      );
+      check(!host.querySelector(".agent-task-recovery"), "Failed startup showed a status error");
       if (destination === "thread" || destination === "settings" || destination === "reply") {
         check(
           draftButton()?.textContent?.includes("Recover this prompt"),

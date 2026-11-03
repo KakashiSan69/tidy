@@ -316,6 +316,9 @@ export function App({
   const [updatingDone, setUpdatingDone] = useState<Record<string, boolean>>({});
   const [sending, setSending] = useState<Record<string, boolean>>({});
   const pendingStarts = useRef(new Map<string, Promise<Thread>>());
+  const waitForStart = useCallback((id: string) => pendingStarts.current.get(id), []);
+  const pendingThreadStarts = useRef(new Map<string, Promise<Thread>>());
+  const waitForThreadStart = useCallback((id: string) => pendingThreadStarts.current.get(id), []);
   const failedStarts = useRef(new Set<string>());
   const sendingKeys = useRef(new Set<string>());
   const [uploading, setUploading] = useState<Record<string, number>>({});
@@ -745,7 +748,7 @@ export function App({
   const queue = useMessageQueue({
     api,
     thread,
-    waitForStart: (id) => pendingStarts.current.get(id),
+    waitForStart,
     onThread(value) {
       setThreads((current) =>
         (current[value.id]?.revision ?? -1) > value.revision
@@ -1748,6 +1751,7 @@ export function App({
             attachmentIds: draft.attachments?.map((file) => file.id),
           });
       pendingStarts.current.set(id, request);
+      if (!selectedThreadId) pendingThreadStarts.current.set(id, request);
       const value = await request;
       setThreads((current) => ({
         ...current,
@@ -1830,6 +1834,7 @@ export function App({
       setError({ projectId, text: errorText(value), original: value });
     } finally {
       pendingStarts.current.delete(id);
+      pendingThreadStarts.current.delete(id);
       sendingKeys.current.delete(key);
       setSending((current) => ({ ...current, [key]: false }));
     }
@@ -2693,6 +2698,7 @@ export function App({
                           onOpenThread={selectThread}
                           connected={machine ? machine.connected : true}
                           orchestrationSupported={orchestrationSupported}
+                          waitForStart={waitForThreadStart}
                         />
                       </BrowserNavigationContext>
                     </FileNavigationContext>
