@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { WebSocket } from "ws";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { ProjectStore } from "../workspace/project-store";
 import { WorkspaceService } from "../workspace/workspace-service";
 import { createRemoteHost } from "./host";
@@ -209,18 +209,44 @@ test("remote file management persists archive, restore, folder deletion and perm
   expect(snapshot.designs).toEqual([]);
 });
 
-for (const namingSupported of [false, true]) {
-  test(`thread starts remain compatible with ${namingSupported ? "naming-capable" : "legacy"} remote hosts`, async () => {
+for (const support of ["legacy", "naming", "unadvertised-worktrees", "worktrees"] as const) {
+  test(`thread starts remain compatible with ${support} remote hosts`, async () => {
+    const namingSupported = support !== "legacy";
+    const worktreesSupported = support === "worktrees";
+    const preWorktrees = support === "legacy" || support === "naming";
     const f = await fixture();
+    if (support === "unadvertised-worktrees") {
+      execFileSync("git", ["init", "-q", f.projectPath]);
+      execFileSync("git", [
+        "-C",
+        f.projectPath,
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.invalid",
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "Initial fixture",
+      ]);
+    }
     const parse = remoteFrameSchema.parse.bind(remoteFrameSchema);
     const frames = spyOn(remoteFrameSchema, "parse").mockImplementation((...args) => {
       const frame = parse(...args);
-      // An older protocol-3 backend sends the same hello without the optional capabilities.
-      return !namingSupported && frame.type === "hello"
-        ? { ...frame, capabilities: undefined }
+      return frame.type === "hello" && !worktreesSupported
+        ? { ...frame, capabilities: namingSupported ? ["thread-naming"] : undefined }
         : frame;
     });
-    const start = spyOn(f.service, "startThread");
+    const startThread = f.service.startThread.bind(f.service);
+    const start = spyOn(f.service, "startThread").mockImplementation(async (input) => {
+      if (preWorktrees && input.threadMode !== undefined)
+        throw new Error("Invalid desktop request.");
+      return startThread(input);
+    });
+    const warm = spyOn(f.service, "warmThread").mockImplementation(async (input) => {
+      if (preWorktrees && input.threadMode !== undefined)
+        throw new Error("Invalid desktop request.");
+    });
     try {
       const { client } = f.client();
       await until(() => client.status.kind === "connected");
@@ -229,6 +255,7 @@ for (const namingSupported of [false, true]) {
         harness: "codex" as const,
         prompt: "Improve the sidebar",
         designIds: [],
+        threadMode: "local" as const,
         naming: {
           mode: "prompt" as const,
           provider: "thread" as const,
@@ -238,6 +265,32 @@ for (const namingSupported of [false, true]) {
       const thread = await client.operation("start-thread", input);
       expect(thread.status).toBe("running");
       expect(start.mock.calls[0][0].naming).toEqual(namingSupported ? input.naming : undefined);
+      expect(thread.worktree).toBeUndefined();
+      expect(start.mock.calls.map(([input]) => input.threadMode)).toEqual(
+        preWorktrees ? ["local", undefined] : ["local"],
+      );
+      await client.operation("warm-thread", {
+        projectId: input.projectId,
+        harness: input.harness,
+        threadMode: input.threadMode,
+      });
+      expect(warm.mock.calls.map(([input]) => input.threadMode)).toEqual(
+        preWorktrees ? ["local", undefined] : ["local"],
+      );
+      expect(input.threadMode).toBe("local");
+      if (!worktreesSupported) {
+        await expect(
+          client.operation("start-thread", { ...input, threadMode: "worktree" }),
+        ).rejects.toThrow("backend update");
+        expect(start).toHaveBeenCalledTimes(preWorktrees ? 2 : 1);
+      }
+      if (support === "unadvertised-worktrees") {
+        start.mockRejectedValueOnce(new Error("Agent failed to start."));
+        await expect(client.operation("start-thread", input)).rejects.toThrow(
+          "Agent failed to start.",
+        );
+        expect(start).toHaveBeenCalledTimes(2);
+      }
       expect(input.naming.instructions).toBe("Keep it brief");
       if (namingSupported) {
         expect(
@@ -268,6 +321,7 @@ for (const namingSupported of [false, true]) {
     } finally {
       frames.mockRestore();
       start.mockRestore();
+      warm.mockRestore();
     }
   });
 }
@@ -664,6 +718,10 @@ test("managed backend refuses an update while an agent is running", async () => 
     },
   });
   expect(response.status).toBe(409);
+  expect(await response.json()).toEqual({
+    error:
+      "Update blocked by active agent runs: 1. Finish active work and disconnect these sessions, then try again.",
+  });
   expect(stopped).toBe(false);
   expect(f.service.activeRunCount).toBeGreaterThan(0);
 });
@@ -979,7 +1037,7 @@ for (const capabilities of [undefined, ["thread-naming"]]) {
         () => client.operation("repository-file", { projectId, path: "sample.txt" }),
       ])
         await expect(operation()).rejects.toThrow(
-          "Repository files need a backend update. Finish active runs and reconnect this machine.",
+          "Repository files need a backend update. Choose Update backend in Settings → Remote machines.",
         );
       expect(requests).not.toHaveBeenCalled();
       expect(client.status.kind).toBe("connected");

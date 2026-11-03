@@ -498,7 +498,7 @@ export class RemoteClient {
     )
       return Promise.reject(
         new Error(
-          "Repository files need a backend update. Finish active runs and reconnect this machine.",
+          "Repository files need a backend update. Choose Update backend in Settings → Remote machines.",
         ),
       );
     if (
@@ -524,6 +524,19 @@ export class RemoteClient {
           ),
         );
     }
+    if (!this.capabilities.includes("thread-worktrees")) {
+      if (name === "project-thread-mode")
+        return Promise.reject(new Error("Thread workspaces need a backend update."));
+      if (
+        (name === "start-thread" || name === "warm-thread") &&
+        typeof input === "object" &&
+        input !== null &&
+        "threadMode" in input
+      ) {
+        if (input.threadMode !== undefined && input.threadMode !== "local")
+          return Promise.reject(new Error("Thread workspaces need a backend update."));
+      }
+    }
     if (
       ["thread-tasks", "set-thread-work-permission", "cancel-thread-task"].includes(name) &&
       !this.capabilities.includes("agent-orchestration")
@@ -538,7 +551,7 @@ export class RemoteClient {
     const frame = JSON.stringify({ id, name, input, ...context });
     if (Buffer.byteLength(frame) > MAX_REMOTE_BYTES || socket.bufferedAmount > MAX_REMOTE_BYTES)
       return Promise.reject(new Error("The remote request is too large."));
-    return new Promise((resolve, reject) => {
+    return new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(
         () => {
           this.pending.delete(id);
@@ -561,6 +574,25 @@ export class RemoteClient {
       socket.send(frame, (error) => {
         if (error) socket.terminate();
       });
+    }).then((response) => {
+      if (
+        this.socket === socket &&
+        !this.capabilities.includes("thread-worktrees") &&
+        (name === "start-thread" || name === "warm-thread") &&
+        typeof input === "object" &&
+        input !== null &&
+        "threadMode" in input &&
+        input.threadMode === "local" &&
+        z
+          .object({ ok: z.literal(false), error: z.literal("Invalid desktop request.") })
+          .safeParse(response).success
+      ) {
+        // This schema rejection occurs before dispatch, so retrying cannot start a second run.
+        const legacyInput: Record<string, unknown> = { ...input };
+        delete legacyInput.threadMode;
+        return this.request(name, legacyInput, context);
+      }
+      return response;
     });
   }
   private async prepare(signal: AbortSignal, update = false): Promise<RemoteConnection> {
@@ -748,7 +780,7 @@ export class RemoteClient {
             [
               connection.host.persistenceWarning,
               !backendUpdate && connection.host.updatePending
-                ? "A backend update is available. Finish active runs and close preview browser tabs and terminals, then choose Update backend in Settings → Remote machines."
+                ? "A backend update is available. Choose Update backend in Settings → Remote machines. Updating closes browser previews on this machine."
                 : undefined,
             ]
               .filter(Boolean)
