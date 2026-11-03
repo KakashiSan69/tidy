@@ -21,7 +21,11 @@ describe("skill catalog boundaries", () => {
         const input = { harness, cwd: "/project" };
         const { skills } = await catalog.list(input);
         expect(
-          await catalog.resolve({ ...input, id: skills[0].id, prompt: `${prefix}review changes` }),
+          await catalog.resolve({
+            ...input,
+            id: skills[0].id,
+            prompt: `Use $HOME then ${prefix}review changes`,
+          }),
         ).toMatchObject({ name: "review" });
         await expect(
           catalog.resolve({ ...input, id: skills[0].id, prompt: `${prefix}other` }),
@@ -151,7 +155,7 @@ describe("skill catalog boundaries", () => {
 });
 
 describe("skill composer", () => {
-  test.each(["/", "$"])("only offers skills for an opening %s token", (prefix) => {
+  test.each(["/", "$"])("offers skills at any whitespace-delimited %s token", (prefix) => {
     expect(skillQuery(prefix, 1)).toBe("");
     expect(skillQuery(`${prefix}rev`, 4)).toBe("rev");
     expect(skillQuery(`${prefix}REV`, 4)).toBe("rev");
@@ -159,33 +163,42 @@ describe("skill composer", () => {
     for (const text of [
       `${prefix}tmp/file`,
       "https://site",
-      `look ${prefix}review`,
       `${prefix}review changes`,
       "`" + prefix + "review`",
-      `\n${prefix}review`,
       "${review}",
       "$(review)",
       "$$review",
     ])
       expect(skillQuery(text, text.length)).toBeNull();
     expect(skillQuery(`${prefix}review`, 3)).toBeNull();
+    expect(skillQuery(`look ${prefix}review`, 12)).toBe("review");
+    expect(skillQuery(`\n${prefix}review`, 8)).toBe("review");
+    expect(skillQuery(`Use ${prefix}`, 5)).toBe("");
+    expect(skillQuery(`Use ${prefix}rev later`, 8)).toBe("rev");
   });
-  test.each(["/", "$"])(
-    "parses opening %s commands and keeps paths and prose literal",
-    (prefix) => {
-      expect(skillCommand(`${prefix}review these changes`)).toEqual({ name: "review", end: 7 });
-      expect(skillCommand(`${prefix}plugin:review\nchanges`)?.name).toBe("plugin:review");
-      for (const text of [
-        `${prefix}review/file`,
-        `${prefix}review.md`,
-        `run ${prefix}review`,
-        `${prefix}${prefix}review`,
-        "${review}",
-        "$(review)",
-      ])
-        expect(skillCommand(text)).toBeNull();
-    },
-  );
+  test.each(["/", "$"])("parses inline %s commands and keeps paths literal", (prefix) => {
+    expect(skillCommand(`${prefix}review these changes`)).toEqual({
+      name: "review",
+      start: 0,
+      end: 7,
+    });
+    expect(skillCommand(`run ${prefix}review changes`)).toEqual({
+      name: "review",
+      start: 4,
+      end: 11,
+    });
+    expect(skillCommand(`Use $HOME then ${prefix}review changes`, ["review"])?.name).toBe("review");
+    expect(skillCommand(`Use $HOME then ${prefix}review changes`, ["missing"])).toBeNull();
+    expect(skillCommand(`${prefix}plugin:review\nchanges`)?.name).toBe("plugin:review");
+    for (const text of [
+      `${prefix}review/file`,
+      `${prefix}review.md`,
+      `${prefix}${prefix}review`,
+      "${review}",
+      "$(review)",
+    ])
+      expect(skillCommand(text)).toBeNull();
+  });
   test("searches descriptions and prioritizes name prefixes", () => {
     const skills = [
       { id: "a", name: "audit", description: "Review changes" },
