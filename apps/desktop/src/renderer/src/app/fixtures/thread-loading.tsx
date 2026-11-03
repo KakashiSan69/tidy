@@ -1,3 +1,5 @@
+import { runPaletteNavigationTests } from "./palette-navigation";
+import { runCommandPaletteTests } from "./command-palette";
 import { runFileLocationTests } from "./file-location";
 import { FileNavigationContext } from "../../features/repository/file-navigation";
 import { runFileNavigationTests } from "./file-navigation";
@@ -412,6 +414,8 @@ async function runThreadLoadingTests(filter = ""): Promise<string[]> {
       check(host.childElementCount === 0, "Renderer test leaked mounted content");
     }
   }
+
+  await run("command palette searches and navigates with the keyboard", runCommandPaletteTests);
 
   await run("file locations preserve focus and reveal exact characters", runFileLocationTests);
 
@@ -6260,6 +6264,10 @@ async function runThreadLoadingTests(filter = ""): Promise<string[]> {
     },
   );
   await runDraftNavigationTests(run, { host, nativeAPI });
+  await run(
+    "command palette retains discovered threads and blocks native terminal shortcuts",
+    (root) => runPaletteNavigationTests(root, nativeAPI),
+  );
 
   return passed;
 }

@@ -10,14 +10,24 @@ import { PrivacySettings } from "./privacy-settings";
 import { AppearanceSettings } from "./appearance-settings";
 import { TerminalSettings } from "./terminal-settings";
 
-const sectionLabels = {
+export const settingsPages = [
+  "account",
+  "appearance",
+  "threads",
+  "terminal",
+  "privacy",
+  "remote",
+] as const;
+export type SettingsPage = (typeof settingsPages)[number];
+
+export const settingsSections = {
   account: "Account",
   appearance: "Appearance",
   threads: "Threads",
   terminal: "Terminal",
   privacy: "Privacy",
   remote: "Remote machines",
-};
+} satisfies Record<SettingsPage, string>;
 
 export function Settings({
   cloud,
@@ -28,9 +38,9 @@ export function Settings({
   cloud: CloudConnection;
   active?: boolean;
   onBack(): void;
-  initialPage?: "account" | "remote";
+  initialPage?: SettingsPage;
 }) {
-  const [page, setPage] = useState<keyof typeof sectionLabels>(initialPage);
+  const [page, setPage] = useState<SettingsPage>(initialPage);
   const machines = window.tidyMachines;
   const remote = window.tidyRemote;
   const back = useRef<HTMLButtonElement>(null);
@@ -63,17 +73,19 @@ export function Settings({
           aria-label="Settings sections"
         >
           <span className="settings-label [@media(max-width:600px)]:hidden">Settings</span>
-          {(["account", "appearance", "threads", "terminal", "privacy"] as const).map((item) => (
-            <Button
-              key={item}
-              className="settings-section shrink-0 [@media(max-width:600px)]:whitespace-nowrap"
-              aria-current={page === item ? "page" : undefined}
-              aria-controls={`settings-${item}-panel`}
-              onClick={() => setPage(item)}
-            >
-              {sectionLabels[item]}
-            </Button>
-          ))}
+          {settingsPages
+            .filter((item) => item !== "remote")
+            .map((item) => (
+              <Button
+                key={item}
+                className="settings-section shrink-0 [@media(max-width:600px)]:whitespace-nowrap"
+                aria-current={page === item ? "page" : undefined}
+                aria-controls={`settings-${item}-panel`}
+                onClick={() => setPage(item)}
+              >
+                {settingsSections[item]}
+              </Button>
+            ))}
           {machines && remote && (
             <Button
               className="settings-section shrink-0 [@media(max-width:600px)]:whitespace-nowrap"
@@ -81,7 +93,7 @@ export function Settings({
               aria-controls="settings-remote-panel"
               onClick={() => setPage("remote")}
             >
-              {sectionLabels.remote}
+              {settingsSections.remote}
             </Button>
           )}
         </nav>
@@ -92,7 +104,7 @@ export function Settings({
         aria-labelledby="settings-title"
       >
         <div className="settings-content">
-          <h1 id="settings-title">{sectionLabels[page]}</h1>
+          <h1 id="settings-title">{settingsSections[page]}</h1>
           <section
             id="settings-account-panel"
             hidden={page !== "account"}
